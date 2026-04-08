@@ -18,9 +18,9 @@ impl Drop for RetiredList {
 
 thread_local! {
     static RETIRED_OBJECTS: RefCell<RetiredList> =
-        RefCell::new(RetiredList(Vec::new()));
+        const { RefCell::new(RetiredList(Vec::new())) };
 
-    static COLLECTION_COUNT: Cell<usize> = Cell::new(0);
+    static COLLECTION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Default)]
