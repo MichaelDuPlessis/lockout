@@ -31,40 +31,21 @@
 //! ```
 
 use std::{
-    cell::{Cell, RefCell},
     ops::Deref,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, Ordering},
 };
 
 /// Number of retires before an automatic collection is triggered (per-thread).
 const COLLECTION_THRESHOLD: u8 = 8;
 
-/// Wrapper around the per-thread retired list that flushes on thread exit.
-struct RetiredList(Vec<Retired>);
-
-impl Drop for RetiredList {
-    fn drop(&mut self) {
-        for r in self.0.drain(..) {
-            unsafe { (r.deleter)(r.ptr) };
-        }
-    }
-}
-
-thread_local! {
-    static RETIRED_OBJECTS: RefCell<RetiredList> =
-        const { RefCell::new(RetiredList(Vec::new())) };
-
-    static COLLECTION_COUNT: Cell<u8> = const { Cell::new(0) };
-}
-
 /// A node in the domain's lock-free hazard linked list.
 #[derive(Debug, Default)]
-struct Node {
+struct HazardNode {
     hazard: AtomicPtr<()>,
-    next: AtomicPtr<Node>,
+    next: AtomicPtr<HazardNode>,
 }
 
-impl Node {
+impl HazardNode {
     const fn new(ptr: *mut ()) -> Self {
         Self {
             hazard: AtomicPtr::new(ptr),
@@ -73,17 +54,11 @@ impl Node {
     }
 }
 
-/// A retired pointer paired with its type-erased deleter.
-#[derive(Debug)]
-struct Retired {
+/// A retired pointer with its type-erased deleter, forming a lock-free intrusive stack.
+struct RetiredNode {
     ptr: *mut (),
     deleter: unsafe fn(*mut ()),
-}
-
-impl Retired {
-    fn new(ptr: *mut (), deleter: unsafe fn(*mut ())) -> Self {
-        Self { ptr, deleter }
-    }
+    next: *mut RetiredNode,
 }
 
 /// A protected reference to a hazard-pointer-guarded value.
@@ -95,7 +70,6 @@ impl Retired {
 /// Dropping the guard (or calling [`clear`](Guard::clear)) releases the hazard slot.
 #[derive(Debug)]
 pub struct Guard<'a, T> {
-    // TODO: Look into whether an atomic read is worth storing less bytes
     slot: &'a AtomicPtr<()>,
     ptr: *mut T,
 }
@@ -116,7 +90,7 @@ impl<'a, T> Guard<'a, T> {
     }
 
     fn set_null(&self) {
-        self.slot.store(std::ptr::null_mut(), Ordering::Release);
+        self.slot.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 
     /// Releases the hazard slot without running the destructor twice.
@@ -146,24 +120,44 @@ impl<T> Drop for Guard<'_, T> {
 /// A hazard pointer domain that manages hazard slots and deferred reclamation.
 ///
 /// All pointers protected and retired through the same domain share a single
-/// hazard list. Typically one global domain is sufficient:
+/// hazard list. Retired pointers are stored in a lock-free Treiber stack and
+/// reclaimed when no hazard slot references them.
+///
+/// Typically one global domain is sufficient:
 ///
 /// ```
 /// use hazardous::Domain;
 /// static DOMAIN: Domain = Domain::new();
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Domain {
-    hazard_list: Node,
+    hazard_list: HazardNode,
+    retired_head: AtomicPtr<RetiredNode>,
+    retire_count: AtomicU8,
 }
 
-// Safety: The hazard list is a lock-free linked list using atomics.
-// All mutations go through atomic operations, making concurrent access safe.
+// Safety: All fields use atomic operations for concurrent access.
 unsafe impl Send for Domain {}
 unsafe impl Sync for Domain {}
 
+impl Default for Domain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for Domain {
     fn drop(&mut self) {
+        // Free all retired nodes unconditionally — no guards can exist
+        // since they borrow the domain.
+        let mut retired = *self.retired_head.get_mut();
+        while !retired.is_null() {
+            let node = unsafe { Box::from_raw(retired) };
+            unsafe { (node.deleter)(node.ptr) };
+            retired = node.next;
+        }
+
+        // Free all hazard list nodes.
         let mut next = self.hazard_list.next.load(Ordering::Relaxed);
         while !next.is_null() {
             let node = unsafe { Box::from_raw(next) };
@@ -178,7 +172,9 @@ impl Domain {
     /// This is a `const fn`, so it can be used in `static` declarations.
     pub const fn new() -> Self {
         Self {
-            hazard_list: Node::new(std::ptr::null_mut()),
+            hazard_list: HazardNode::new(std::ptr::null_mut()),
+            retired_head: AtomicPtr::new(std::ptr::null_mut()),
+            retire_count: AtomicU8::new(0),
         }
     }
 
@@ -189,14 +185,14 @@ impl Domain {
     /// the pointer is null.
     pub fn protect<T>(&self, ptr: &AtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
-            let ptr_before = ptr.load(Ordering::Acquire);
+            let ptr_before = ptr.load(Ordering::SeqCst);
             if ptr_before.is_null() {
                 return None;
             }
 
             let guard = self.reserve(ptr_before);
 
-            let ptr_after = ptr.load(Ordering::Acquire);
+            let ptr_after = ptr.load(Ordering::SeqCst);
             if ptr_after == ptr_before {
                 return Some(guard);
             }
@@ -228,7 +224,7 @@ impl Domain {
                 .compare_exchange_weak(
                     std::ptr::null_mut(),
                     ptr as *mut (),
-                    Ordering::Release,
+                    Ordering::SeqCst,
                     Ordering::Relaxed,
                 )
                 .is_ok()
@@ -242,12 +238,12 @@ impl Domain {
                 continue;
             }
 
-            let new_node = Box::into_raw(Box::new(Node::new(ptr as *mut ())));
-            match current.next.compare_exchange_weak(
+            let new_node = Box::into_raw(Box::new(HazardNode::new(ptr as *mut ())));
+            match current.next.compare_exchange(
                 std::ptr::null_mut(),
                 new_node,
                 Ordering::Release,
-                Ordering::Relaxed,
+                Ordering::Acquire,
             ) {
                 Ok(_) => {
                     return Guard::new(
@@ -269,6 +265,21 @@ impl Domain {
         }
     }
 
+    /// Pushes a retired node onto the lock-free Treiber stack.
+    fn push_retired(&self, node: *mut RetiredNode) {
+        loop {
+            let head = self.retired_head.load(Ordering::Relaxed);
+            unsafe { (*node).next = head };
+            if self
+                .retired_head
+                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// Retires the pointer held by `guard`, scheduling it for deferred reclamation.
     ///
     /// The guard is consumed, releasing its hazard slot. The caller must ensure
@@ -284,37 +295,35 @@ impl Domain {
     /// with `Box` and is no longer reachable through any shared atomic.
     pub fn retire_ptr<T>(&self, ptr: *mut T) {
         unsafe fn deleter<T>(p: *mut ()) {
-            let tp = p as *mut T;
-            drop(unsafe { Box::from_raw(tp) });
+            drop(unsafe { Box::from_raw(p as *mut T) });
         }
 
-        RETIRED_OBJECTS.with(|objects| {
-            objects
-                .borrow_mut()
-                .0
-                .push(Retired::new(ptr as *mut (), deleter::<T>));
-        });
+        let node = Box::into_raw(Box::new(RetiredNode {
+            ptr: ptr as *mut (),
+            deleter: deleter::<T>,
+            next: std::ptr::null_mut(),
+        }));
+        self.push_retired(node);
 
-        let counter = COLLECTION_COUNT.get() + 1;
-        if counter.is_multiple_of(COLLECTION_THRESHOLD) {
+        let count = self.retire_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_multiple_of(COLLECTION_THRESHOLD) {
             self.collect();
         }
-        COLLECTION_COUNT.set(counter);
     }
 
     /// Scans all hazard slots and reclaims any retired pointers that are not
     /// currently protected.
     ///
     /// This is called automatically every [`COLLECTION_THRESHOLD`] retires, but
-    /// can also be called manually to force reclamation. Resets the per-thread
-    /// retire counter.
+    /// can also be called manually to force reclamation. Resets the retire counter.
     pub fn collect(&self) {
-        COLLECTION_COUNT.set(0);
-        let mut current = &self.hazard_list;
-        let mut hazard_ptrs = Vec::new();
+        self.retire_count.store(0, Ordering::Relaxed);
 
+        // Snapshot all active hazard pointers.
+        let mut hazard_ptrs = Vec::new();
+        let mut current = &self.hazard_list;
         loop {
-            let ptr = current.hazard.load(Ordering::Acquire);
+            let ptr = current.hazard.load(Ordering::SeqCst);
             if !ptr.is_null() {
                 hazard_ptrs.push(ptr);
             }
@@ -325,18 +334,20 @@ impl Domain {
             current = unsafe { &*next };
         }
 
-        RETIRED_OBJECTS.with(|objects| {
-            let mut list = objects.borrow_mut();
-            let vec = &mut list.0;
-            let mut i = 0;
-            while i < vec.len() {
-                if hazard_ptrs.contains(&vec[i].ptr) {
-                    i += 1;
-                } else {
-                    let r = vec.swap_remove(i);
-                    unsafe { (r.deleter)(r.ptr) };
-                }
+        // Atomically claim the entire retired stack.
+        let mut retired = self.retired_head.swap(std::ptr::null_mut(), Ordering::Acquire);
+
+        // Walk the claimed list: free unprotected entries, push back protected ones.
+        while !retired.is_null() {
+            let node = unsafe { Box::from_raw(retired) };
+            retired = node.next;
+
+            if hazard_ptrs.contains(&node.ptr) {
+                let raw = Box::into_raw(node);
+                self.push_retired(raw);
+            } else {
+                unsafe { (node.deleter)(node.ptr) };
             }
-        });
+        }
     }
 }
