@@ -116,7 +116,7 @@ impl<'a, T> Guard<'a, T> {
     }
 
     fn set_null(&self) {
-        self.slot.store(std::ptr::null_mut(), Ordering::SeqCst);
+        self.slot.store(std::ptr::null_mut(), Ordering::Release);
     }
 
     /// Releases the hazard slot without running the destructor twice.
@@ -189,14 +189,14 @@ impl Domain {
     /// the pointer is null.
     pub fn protect<T>(&self, ptr: &AtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
-            let ptr_before = ptr.load(Ordering::SeqCst);
+            let ptr_before = ptr.load(Ordering::Acquire);
             if ptr_before.is_null() {
                 return None;
             }
 
             let guard = self.reserve(ptr_before);
 
-            let ptr_after = ptr.load(Ordering::SeqCst);
+            let ptr_after = ptr.load(Ordering::Acquire);
             if ptr_after == ptr_before {
                 return Some(guard);
             }
@@ -222,22 +222,21 @@ impl Domain {
     fn reserve<T>(&self, ptr: *mut T) -> Guard<'_, T> {
         let mut current = &self.hazard_list;
 
-        // TODO: Change ordering. SeqCst just for now
         loop {
             if current
                 .hazard
                 .compare_exchange_weak(
                     std::ptr::null_mut(),
                     ptr as *mut (),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    Ordering::Release,
+                    Ordering::Relaxed,
                 )
                 .is_ok()
             {
                 return Guard::new(&current.hazard, ptr);
             }
 
-            let next = current.next.load(Ordering::SeqCst);
+            let next = current.next.load(Ordering::Acquire);
             if !next.is_null() {
                 current = unsafe { next.as_ref().unwrap_unchecked() };
                 continue;
@@ -247,8 +246,8 @@ impl Domain {
             match current.next.compare_exchange_weak(
                 std::ptr::null_mut(),
                 new_node,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     return Guard::new(
@@ -261,7 +260,7 @@ impl Domain {
                     current = unsafe {
                         current
                             .next
-                            .load(Ordering::SeqCst)
+                            .load(Ordering::Acquire)
                             .as_ref()
                             .unwrap_unchecked()
                     };
@@ -315,11 +314,11 @@ impl Domain {
         let mut hazard_ptrs = Vec::new();
 
         loop {
-            let ptr = current.hazard.load(Ordering::SeqCst);
+            let ptr = current.hazard.load(Ordering::Acquire);
             if !ptr.is_null() {
                 hazard_ptrs.push(ptr);
             }
-            let next = current.next.load(Ordering::SeqCst);
+            let next = current.next.load(Ordering::Acquire);
             if next.is_null() {
                 break;
             }
