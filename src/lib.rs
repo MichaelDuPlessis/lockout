@@ -335,7 +335,9 @@ impl Domain {
         }
 
         // Atomically claim the entire retired stack.
-        let mut retired = self.retired_head.swap(std::ptr::null_mut(), Ordering::Acquire);
+        let mut retired = self
+            .retired_head
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
 
         // Walk the claimed list: free unprotected entries, push back protected ones.
         while !retired.is_null() {
