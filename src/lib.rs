@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
-const COLLECTION_THRESHOLD: usize = 8;
+const COLLECTION_THRESHOLD: u8 = 8;
 
 struct RetiredList(Vec<Retired>);
 
@@ -20,7 +20,7 @@ thread_local! {
     static RETIRED_OBJECTS: RefCell<RetiredList> =
         const { RefCell::new(RetiredList(Vec::new())) };
 
-    static COLLECTION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static COLLECTION_COUNT: Cell<u8> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Default)]
@@ -30,10 +30,10 @@ struct Node {
 }
 
 impl Node {
-    fn new(ptr: *mut ()) -> Self {
+    const fn new(ptr: *mut ()) -> Self {
         Self {
             hazard: AtomicPtr::new(ptr),
-            ..Default::default()
+            next: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -112,29 +112,33 @@ impl Drop for Domain {
 }
 
 impl Domain {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            hazard_list: Node::default(),
+            hazard_list: Node::new(std::ptr::null_mut()),
         }
     }
 
     pub fn protect<T>(&self, ptr: &AtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
-            // Check if the ptr is fine
             let ptr_before = ptr.load(Ordering::SeqCst);
             if ptr_before.is_null() {
                 return None;
             }
 
-            // Get a guard
             let guard = self.reserve(ptr_before);
 
-            // Make sure its the same
             let ptr_after = ptr.load(Ordering::SeqCst);
             if ptr_after == ptr_before {
                 return Some(guard);
             }
         }
+    }
+
+    pub fn protect_ptr<T>(&self, ptr: *mut T) -> Option<Guard<'_, T>> {
+        if ptr.is_null() {
+            return None;
+        }
+        Some(self.reserve(ptr))
     }
 
     fn reserve<T>(&self, ptr: *mut T) -> Guard<'_, T> {
@@ -195,28 +199,31 @@ impl Domain {
     }
 
     pub fn retire<T>(&self, guard: Guard<'_, T>) {
+        self.retire_ptr::<T>(guard.ptr);
+    }
+
+    pub fn retire_ptr<T>(&self, ptr: *mut T) {
         unsafe fn deleter<T>(p: *mut ()) {
             let tp = p as *mut T;
             drop(unsafe { Box::from_raw(tp) });
         }
 
-        // Push onto this thread's retired list
         RETIRED_OBJECTS.with(|objects| {
             objects
                 .borrow_mut()
                 .0
-                .push(Retired::new(guard.ptr as *mut (), deleter::<T>));
+                .push(Retired::new(ptr as *mut (), deleter::<T>));
         });
 
-        // Check if its time to try and collect retired nodes
-        let (counter, _) = COLLECTION_COUNT.get().overflowing_add(1);
+        let counter = COLLECTION_COUNT.get() + 1;
         if counter.is_multiple_of(COLLECTION_THRESHOLD) {
             self.collect();
         }
         COLLECTION_COUNT.set(counter);
     }
 
-    fn collect(&self) {
+    pub fn collect(&self) {
+        COLLECTION_COUNT.set(0);
         let mut current = &self.hazard_list;
         let mut hazard_ptrs = Vec::new();
 
