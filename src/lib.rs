@@ -1,13 +1,24 @@
 use std::{
     cell::{Cell, RefCell},
+    ops::Deref,
     sync::atomic::{AtomicPtr, Ordering},
 };
 
 const COLLECTION_THRESHOLD: usize = 8;
 
+struct RetiredList(Vec<Retired>);
+
+impl Drop for RetiredList {
+    fn drop(&mut self) {
+        for r in self.0.drain(..) {
+            unsafe { (r.deleter)(r.ptr) };
+        }
+    }
+}
+
 thread_local! {
-    static RETIRED_OBJECTS: RefCell<Vec<Retired>> =
-        RefCell::new(Vec::new());
+    static RETIRED_OBJECTS: RefCell<RetiredList> =
+        RefCell::new(RetiredList(Vec::new()));
 
     static COLLECTION_COUNT: Cell<usize> = Cell::new(0);
 }
@@ -16,6 +27,15 @@ thread_local! {
 struct Node {
     hazard: AtomicPtr<()>,
     next: AtomicPtr<Node>,
+}
+
+impl Node {
+    fn new(ptr: *mut ()) -> Self {
+        Self {
+            hazard: AtomicPtr::new(ptr),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -32,9 +52,13 @@ impl Retired {
 
 #[derive(Debug)]
 pub struct Guard<'a, T> {
+    // TODO: Look into whether an atomic read is worth storing less bytes
     slot: &'a AtomicPtr<()>,
     ptr: *mut T,
 }
+
+unsafe impl<T: Send + Sync> Send for Guard<'_, T> {}
+unsafe impl<T: Send + Sync> Sync for Guard<'_, T> {}
 
 impl<'a, T> Guard<'a, T> {
     fn new(slot: &'a AtomicPtr<()>, ptr: *mut T) -> Self {
@@ -55,18 +79,45 @@ impl<'a, T> Guard<'a, T> {
     }
 }
 
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.get()
+    }
+}
+
 impl<'a, T> Drop for Guard<'a, T> {
     fn drop(&mut self) {
         self.set_null();
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Domain {
     hazard_list: Node,
 }
 
+unsafe impl Send for Domain {}
+unsafe impl Sync for Domain {}
+
+impl Drop for Domain {
+    fn drop(&mut self) {
+        let mut next = self.hazard_list.next.load(Ordering::Relaxed);
+        while !next.is_null() {
+            let node = unsafe { Box::from_raw(next) };
+            next = node.next.load(Ordering::Relaxed);
+        }
+    }
+}
+
 impl Domain {
+    pub fn new() -> Self {
+        Self {
+            hazard_list: Node::default(),
+        }
+    }
+
     pub fn protect<T>(&self, ptr: &AtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
             // Check if the ptr is fine
@@ -114,7 +165,7 @@ impl Domain {
             }
 
             // If none of the previous occured it means we have gone through the entire list and it is time to allocate a new node
-            let new_node = Box::into_raw(Box::new(Node::default()));
+            let new_node = Box::into_raw(Box::new(Node::new(ptr as *mut ())));
             match current.next.compare_exchange_weak(
                 std::ptr::null_mut(),
                 new_node,
@@ -153,6 +204,7 @@ impl Domain {
         RETIRED_OBJECTS.with(|objects| {
             objects
                 .borrow_mut()
+                .0
                 .push(Retired::new(guard.ptr as *mut (), deleter::<T>));
         });
 
@@ -165,21 +217,27 @@ impl Domain {
     }
 
     fn collect(&self) {
-        let current = &self.hazard_list;
+        let mut current = &self.hazard_list;
         let mut hazard_ptrs = Vec::new();
 
-        while current.next.load(Ordering::SeqCst) != std::ptr::null_mut() {
+        loop {
             let ptr = current.hazard.load(Ordering::SeqCst);
-            if ptr != std::ptr::null_mut() {
+            if !ptr.is_null() {
                 hazard_ptrs.push(ptr);
             }
+            let next = current.next.load(Ordering::SeqCst);
+            if next.is_null() {
+                break;
+            }
+            current = unsafe { &*next };
         }
 
         RETIRED_OBJECTS.with(|objects| {
-            let mut vec = objects.borrow_mut();
+            let mut list = objects.borrow_mut();
+            let vec = &mut list.0;
             let mut i = 0;
             while i < vec.len() {
-                if hazard_ptrs.contains(unsafe { &vec.get_unchecked(i).ptr }) {
+                if hazard_ptrs.contains(&vec[i].ptr) {
                     i += 1;
                 } else {
                     let r = vec.swap_remove(i);
