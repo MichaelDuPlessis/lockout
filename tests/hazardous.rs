@@ -13,7 +13,7 @@ fn protect_returns_none_for_null() {
 
 #[test]
 fn protect_ptr_returns_none_for_null() {
-    assert!(DOMAIN.protect_ptr::<i32>(std::ptr::null_mut()).is_none());
+    assert!(unsafe { DOMAIN.protect_ptr::<i32>(std::ptr::null_mut()) }.is_none());
 }
 
 #[test]
@@ -26,18 +26,18 @@ fn protect_and_deref() {
     guard.clear();
 
     // Clean up
-    DOMAIN.retire_ptr::<i32>(val);
+    unsafe { DOMAIN.retire_ptr::<i32>(val) };
     DOMAIN.collect();
 }
 
 #[test]
 fn protect_ptr_and_deref() {
     let val = Box::into_raw(Box::new(99));
-    let guard = DOMAIN.protect_ptr(val).unwrap();
+    let guard = unsafe { DOMAIN.protect_ptr(val) }.unwrap();
     assert_eq!(*guard, 99);
     guard.clear();
 
-    DOMAIN.retire_ptr::<i32>(val);
+    unsafe { DOMAIN.retire_ptr::<i32>(val) };
     DOMAIN.collect();
 }
 
@@ -51,7 +51,7 @@ fn guard_clear_releases_slot() {
 
     // After clear, retiring and collecting should reclaim
     ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
-    DOMAIN.retire_ptr::<i32>(val);
+    unsafe { DOMAIN.retire_ptr::<i32>(val) };
     DOMAIN.collect();
 }
 
@@ -66,7 +66,7 @@ fn guard_drop_releases_slot() {
     // Guard dropped, slot released
 
     ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
-    DOMAIN.retire_ptr::<i32>(val);
+    unsafe { DOMAIN.retire_ptr::<i32>(val) };
     DOMAIN.collect();
 }
 
@@ -93,7 +93,7 @@ fn collect_does_not_reclaim_protected_pointer() {
     // Retire the pointer while it's still protected
     let new_val = Box::into_raw(Box::new(456));
     ptr.store(new_val, Ordering::Relaxed);
-    DOMAIN.retire_ptr::<i32>(val);
+    unsafe { DOMAIN.retire_ptr::<i32>(val) };
     DOMAIN.collect();
 
     // Should still be readable through the guard
@@ -103,7 +103,7 @@ fn collect_does_not_reclaim_protected_pointer() {
 
     // Clean up new_val
     ptr.store(std::ptr::null_mut(), Ordering::Relaxed);
-    DOMAIN.retire_ptr::<i32>(new_val);
+    unsafe { DOMAIN.retire_ptr::<i32>(new_val) };
     DOMAIN.collect();
 }
 
@@ -149,7 +149,7 @@ fn concurrent_protect_and_retire() {
                 let new = Box::into_raw(Box::new(Tracked(drop_count.clone())));
                 let old = shared.swap(new, Ordering::AcqRel);
                 if !old.is_null() {
-                    domain.retire_ptr::<Tracked>(old);
+                    unsafe { domain.retire_ptr::<Tracked>(old) };
                 }
             }
         }));
@@ -162,7 +162,7 @@ fn concurrent_protect_and_retire() {
     // Final cleanup
     let last = shared.swap(std::ptr::null_mut(), Ordering::Relaxed);
     if !last.is_null() {
-        domain.retire_ptr::<Tracked>(last);
+        unsafe { domain.retire_ptr::<Tracked>(last) };
     }
     domain.collect();
 
@@ -186,8 +186,8 @@ fn multiple_guards_same_domain() {
     guard_a.clear();
     guard_b.clear();
 
-    DOMAIN.retire_ptr::<i32>(a);
-    DOMAIN.retire_ptr::<i32>(b);
+    unsafe { DOMAIN.retire_ptr::<i32>(a) };
+    unsafe { DOMAIN.retire_ptr::<i32>(b) };
     DOMAIN.collect();
 }
 
@@ -212,7 +212,7 @@ fn domain_drop_frees_nodes() {
     }
 
     for (p, _) in &ptrs {
-        domain.retire_ptr::<i32>(*p);
+        unsafe { domain.retire_ptr::<i32>(*p) };
     }
     domain.collect();
 

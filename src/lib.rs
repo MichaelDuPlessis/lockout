@@ -22,11 +22,12 @@
 //! // Swap in a new value and retire the old one.
 //! let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst);
 //! guard.clear();
-//! DOMAIN.retire_ptr::<i32>(old);
+//! // Safety: `old` was allocated with Box and is no longer reachable from `shared`.
+//! unsafe { DOMAIN.retire_ptr::<i32>(old) };
 //!
 //! // Clean up the remaining allocation.
 //! let last = shared.swap(std::ptr::null_mut(), Ordering::SeqCst);
-//! DOMAIN.retire_ptr::<i32>(last);
+//! unsafe { DOMAIN.retire_ptr::<i32>(last) };
 //! DOMAIN.collect();
 //! ```
 
@@ -204,7 +205,11 @@ impl Domain {
     /// Unlike [`protect`](Domain::protect), this does not verify the pointer
     /// against an `AtomicPtr` source. The caller must ensure the pointer is
     /// valid. Returns `None` if the pointer is null.
-    pub fn protect_ptr<T>(&self, ptr: *mut T) -> Option<Guard<'_, T>> {
+    ///
+    /// # Safety
+    ///
+    /// The pointer must point to a valid, live allocation.
+    pub unsafe fn protect_ptr<T>(&self, ptr: *mut T) -> Option<Guard<'_, T>> {
         if ptr.is_null() {
             return None;
         }
@@ -285,7 +290,9 @@ impl Domain {
     /// The guard is consumed, releasing its hazard slot. The caller must ensure
     /// the pointer is no longer reachable through any shared atomic before calling this.
     pub fn retire<T>(&self, guard: Guard<'_, T>) {
-        self.retire_ptr::<T>(guard.ptr);
+        // Safety: the guard proves the pointer was obtained through protect,
+        // and the caller is responsible for ensuring it's no longer reachable.
+        unsafe { self.retire_ptr::<T>(guard.ptr) };
     }
 
     /// Retires a raw pointer, scheduling it for deferred reclamation.
@@ -293,7 +300,13 @@ impl Domain {
     /// The pointer will be deallocated (via `Box::from_raw`) once no hazard slot
     /// references it. The caller must ensure the pointer was originally allocated
     /// with `Box` and is no longer reachable through any shared atomic.
-    pub fn retire_ptr<T>(&self, ptr: *mut T) {
+    ///
+    /// # Safety
+    ///
+    /// - The pointer must have been allocated with `Box`.
+    /// - The pointer must no longer be reachable from any shared atomic.
+    /// - The pointer must not be retired more than once.
+    pub unsafe fn retire_ptr<T>(&self, ptr: *mut T) {
         unsafe fn deleter<T>(p: *mut ()) {
             drop(unsafe { Box::from_raw(p as *mut T) });
         }
