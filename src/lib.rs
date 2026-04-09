@@ -37,7 +37,7 @@ use std::{
 };
 
 /// Number of retires before an automatic collection is triggered.
-const COLLECTION_THRESHOLD: u8 = 8;
+const DEFAULT_COLLECTION_THRESHOLD: u8 = 8;
 
 /// A node in the domain's lock-free hazard linked list.
 #[derive(Debug, Default)]
@@ -219,7 +219,7 @@ impl<T> Drop for Guard<'_, T> {
 /// static DOMAIN: Domain = Domain::new();
 /// ```
 #[derive(Debug)]
-pub struct Domain {
+pub struct Domain<const COLLECTION_THRESHOLD: u8 = DEFAULT_COLLECTION_THRESHOLD> {
     hazard_list: HazardNode,
     retired_head: StdAtomicPtr<RetiredNode>,
     retire_count: AtomicU8,
@@ -229,13 +229,13 @@ pub struct Domain {
 unsafe impl Send for Domain {}
 unsafe impl Sync for Domain {}
 
-impl Default for Domain {
+impl Default for Domain<DEFAULT_COLLECTION_THRESHOLD> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for Domain {
+impl<const COLLECTION_THRESHOLD: u8> Drop for Domain<COLLECTION_THRESHOLD> {
     fn drop(&mut self) {
         // Free all retired nodes unconditionally — no guards can exist
         // since they borrow the domain.
@@ -260,6 +260,15 @@ impl Domain {
     ///
     /// This is a `const fn`, so it can be used in `static` declarations.
     pub const fn new() -> Self {
+        Self::with_threshold()
+    }
+}
+
+impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
+    /// Creates a new hazard pointer domain with a threshold for automatic pointer reclamation specified as a generic parameter.
+    ///
+    /// This is a `const fn`, so it can be used in `static` declarations.
+    pub const fn with_threshold() -> Self {
         Self {
             hazard_list: HazardNode::new(std::ptr::null_mut()),
             retired_head: StdAtomicPtr::new(std::ptr::null_mut()),
@@ -281,7 +290,7 @@ impl Domain {
     /// Uses a load-reserve-verify loop to ensure the returned guard protects
     /// the value that was in `ptr` at the time of the call. Returns `None` if
     /// the pointer is null.
-    pub fn protect_atomic<T>(&self, ptr: &StdAtomicPtr<T>) -> Option<Guard<'_, T>> {
+    fn protect_atomic<T>(&self, ptr: &StdAtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
             let ptr_before = ptr.load(Ordering::SeqCst);
             if ptr_before.is_null() {
