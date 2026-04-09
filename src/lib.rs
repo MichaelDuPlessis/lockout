@@ -8,8 +8,8 @@
 //! # Example
 //!
 //! ```
-//! use std::sync::atomic::{AtomicPtr, Ordering};
-//! use hazardous::Domain;
+//! use std::sync::atomic::Ordering;
+//! use hazardous::{Domain, AtomicPtr};
 //!
 //! static DOMAIN: Domain = Domain::new();
 //!
@@ -19,38 +19,38 @@
 //! let guard = DOMAIN.protect(&shared).unwrap();
 //! assert_eq!(*guard, 42);
 //!
-//! // Swap in a new value and retire the old one.
-//! let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst);
+//! // Swap in a new value — returns a Replaced that must be retired.
+//! let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst).unwrap();
 //! guard.clear();
-//! // Safety: `old` was allocated with Box and is no longer reachable from `shared`.
-//! unsafe { DOMAIN.retire_ptr::<i32>(old) };
+//! old.retire(&DOMAIN);
 //!
 //! // Clean up the remaining allocation.
-//! let last = shared.swap(std::ptr::null_mut(), Ordering::SeqCst);
-//! unsafe { DOMAIN.retire_ptr::<i32>(last) };
+//! let last = shared.swap(std::ptr::null_mut(), Ordering::SeqCst).unwrap();
+//! last.retire(&DOMAIN);
 //! DOMAIN.collect();
 //! ```
 
 use std::{
     ops::Deref,
-    sync::atomic::{AtomicPtr, AtomicU8, Ordering},
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr as StdAtomicPtr, AtomicU8, Ordering},
 };
 
-/// Number of retires before an automatic collection is triggered (per-thread).
+/// Number of retires before an automatic collection is triggered.
 const COLLECTION_THRESHOLD: u8 = 8;
 
 /// A node in the domain's lock-free hazard linked list.
 #[derive(Debug, Default)]
 struct HazardNode {
-    hazard: AtomicPtr<()>,
-    next: AtomicPtr<HazardNode>,
+    hazard: StdAtomicPtr<()>,
+    next: StdAtomicPtr<HazardNode>,
 }
 
 impl HazardNode {
     const fn new(ptr: *mut ()) -> Self {
         Self {
-            hazard: AtomicPtr::new(ptr),
-            next: AtomicPtr::new(std::ptr::null_mut()),
+            hazard: StdAtomicPtr::new(ptr),
+            next: StdAtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -62,6 +62,94 @@ struct RetiredNode {
     next: *mut RetiredNode,
 }
 
+/// A pointer that has been displaced from a [`AtomicPtr`] and must be retired.
+///
+/// This type cannot be dereferenced — the value is no longer safely accessible
+/// without a hazard guard. The only valid operation is to [`retire`](Replaced::retire)
+/// it through a [`Domain`], which schedules it for deferred reclamation.
+///
+/// Dropping a `Replaced` without retiring it will leak the allocation.
+pub struct Replaced<T> {
+    ptr: NonNull<T>,
+}
+
+impl<T> Replaced<T> {
+    /// Retires this pointer, scheduling it for deferred reclamation.
+    ///
+    /// The pointed-to value will be deallocated once no hazard slot references it.
+    pub fn retire(self, domain: &Domain) {
+        unsafe { domain.retire_ptr(self.ptr.as_ptr()) };
+        std::mem::forget(self);
+    }
+}
+
+impl<T> Drop for Replaced<T> {
+    fn drop(&mut self) {
+        // Intentional leak — if the user drops without retiring, we can't
+        // safely free because another thread may still hold a guard.
+        // This is preferable to a use-after-free.
+        #[cfg(debug_assertions)]
+        eprintln!("hazardous: Replaced<T> dropped without retiring — memory leaked");
+    }
+}
+
+/// A managed atomic pointer type for use with hazard pointer domains.
+///
+/// Wraps [`AtomicPtr`] and returns [`Replaced<T>`] from mutation operations,
+/// ensuring displaced pointers are properly retired.
+#[derive(Debug)]
+pub struct AtomicPtr<T> {
+    inner: StdAtomicPtr<T>,
+}
+
+impl<T> AtomicPtr<T> {
+    /// Creates a new `AtomicPtr` from a raw pointer.
+    pub const fn new(ptr: *mut T) -> Self {
+        Self {
+            inner: StdAtomicPtr::new(ptr),
+        }
+    }
+
+    /// Creates a new `AtomicPtr` from a [`Box`].
+    pub fn from_box(val: Box<T>) -> Self {
+        Self::new(Box::into_raw(val))
+    }
+
+    /// Atomically swaps the pointer, returning the old value as a [`Replaced<T>`]
+    /// that must be retired. Returns `None` if the old pointer was null.
+    pub fn swap(&self, new: *mut T, order: Ordering) -> Option<Replaced<T>> {
+        let old = self.inner.swap(new, order);
+        NonNull::new(old).map(|ptr| Replaced { ptr })
+    }
+
+    /// Atomically compares and exchanges the pointer. On success, returns
+    /// `Ok(Replaced<T>)` containing the old value that must be retired.
+    /// On failure, returns `Err(*mut T)` with the current value.
+    pub fn compare_exchange(
+        &self,
+        current: *mut T,
+        new: *mut T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<Replaced<T>>, *mut T> {
+        self.inner
+            .compare_exchange(current, new, success, failure)
+            .map(|old| NonNull::new(old).map(|ptr| Replaced { ptr }))
+    }
+}
+
+impl<T> From<StdAtomicPtr<T>> for AtomicPtr<T> {
+    fn from(ptr: StdAtomicPtr<T>) -> Self {
+        Self { inner: ptr }
+    }
+}
+
+impl<T> From<Box<T>> for AtomicPtr<T> {
+    fn from(val: Box<T>) -> Self {
+        Self::from_box(val)
+    }
+}
+
 /// A protected reference to a hazard-pointer-guarded value.
 ///
 /// While a `Guard` exists, the underlying pointer is published in a hazard slot,
@@ -71,7 +159,7 @@ struct RetiredNode {
 /// Dropping the guard (or calling [`clear`](Guard::clear)) releases the hazard slot.
 #[derive(Debug)]
 pub struct Guard<'a, T> {
-    slot: &'a AtomicPtr<()>,
+    slot: &'a StdAtomicPtr<()>,
     ptr: *mut T,
 }
 
@@ -81,7 +169,7 @@ unsafe impl<T: Send + Sync> Send for Guard<'_, T> {}
 unsafe impl<T: Send + Sync> Sync for Guard<'_, T> {}
 
 impl<'a, T> Guard<'a, T> {
-    fn new(slot: &'a AtomicPtr<()>, ptr: *mut T) -> Self {
+    fn new(slot: &'a StdAtomicPtr<()>, ptr: *mut T) -> Self {
         Self { slot, ptr }
     }
 
@@ -133,7 +221,7 @@ impl<T> Drop for Guard<'_, T> {
 #[derive(Debug)]
 pub struct Domain {
     hazard_list: HazardNode,
-    retired_head: AtomicPtr<RetiredNode>,
+    retired_head: StdAtomicPtr<RetiredNode>,
     retire_count: AtomicU8,
 }
 
@@ -174,17 +262,26 @@ impl Domain {
     pub const fn new() -> Self {
         Self {
             hazard_list: HazardNode::new(std::ptr::null_mut()),
-            retired_head: AtomicPtr::new(std::ptr::null_mut()),
+            retired_head: StdAtomicPtr::new(std::ptr::null_mut()),
             retire_count: AtomicU8::new(0),
         }
     }
 
-    /// Protects the pointer stored in `ptr` by publishing it in a hazard slot.
+    /// Protects the pointer stored in a [`AtomicPtr`] by publishing it in a hazard slot.
     ///
     /// Uses a load-reserve-verify loop to ensure the returned guard protects
     /// the value that was in `ptr` at the time of the call. Returns `None` if
     /// the pointer is null.
     pub fn protect<T>(&self, ptr: &AtomicPtr<T>) -> Option<Guard<'_, T>> {
+        self.protect_atomic(&ptr.inner)
+    }
+
+    /// Protects the pointer stored in a std [`AtomicPtr`](std::sync::atomic::AtomicPtr) by publishing it in a hazard slot.
+    ///
+    /// Uses a load-reserve-verify loop to ensure the returned guard protects
+    /// the value that was in `ptr` at the time of the call. Returns `None` if
+    /// the pointer is null.
+    pub fn protect_atomic<T>(&self, ptr: &StdAtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
             let ptr_before = ptr.load(Ordering::SeqCst);
             if ptr_before.is_null() {
@@ -298,8 +395,7 @@ impl Domain {
     /// Retires a raw pointer, scheduling it for deferred reclamation.
     ///
     /// The pointer will be deallocated (via `Box::from_raw`) once no hazard slot
-    /// references it. The caller must ensure the pointer was originally allocated
-    /// with `Box` and is no longer reachable through any shared atomic.
+    /// references it.
     ///
     /// # Safety
     ///
