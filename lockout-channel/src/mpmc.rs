@@ -43,7 +43,10 @@ impl<T> Queue<T> {
     }
 }
 
-impl<T> Queue<T> {
+impl<T> Queue<T>
+where
+    T: Send + Sync,
+{
     pub fn enqueue(&self, data: T) {
         let new_node = Node::new(data).into_raw();
 
@@ -120,3 +123,24 @@ impl<T> Queue<T> {
         }
     }
 }
+
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        let head = unsafe { Box::from_raw(self.head.load(Ordering::Relaxed)) };
+        let mut next = head.next;
+
+        while !next.load(Ordering::Acquire).is_null() {
+            let mut node = unsafe { Box::from_raw(next.load(Ordering::Relaxed)) };
+
+            // Drop the initialized data
+            unsafe { node.data.assume_init_drop() };
+
+            // Move on to the next node
+            next = node.next;
+        }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for Queue<T> {}
+
+unsafe impl<T: Send + Sync> Sync for Queue<T> {}
