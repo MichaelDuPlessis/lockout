@@ -9,7 +9,7 @@
 //!
 //! ```
 //! use std::sync::atomic::Ordering;
-//! use hazardous::{Domain, AtomicPtr};
+//! use lockout_hazard::{Domain, AtomicPtr};
 //!
 //! static DOMAIN: Domain = Domain::new();
 //!
@@ -89,7 +89,7 @@ impl<T> Drop for Replaced<T> {
         // safely free because another thread may still hold a guard.
         // This is preferable to a use-after-free.
         #[cfg(debug_assertions)]
-        eprintln!("hazardous: Replaced<T> dropped without retiring — memory leaked");
+        eprintln!("lockout_hazard: Replaced<T> dropped without retiring — memory leaked");
     }
 }
 
@@ -215,7 +215,7 @@ impl<T> Drop for Guard<'_, T> {
 /// Typically one global domain is sufficient:
 ///
 /// ```
-/// use hazardous::Domain;
+/// use lockout_hazard::Domain;
 /// static DOMAIN: Domain = Domain::new();
 /// ```
 #[derive(Debug)]

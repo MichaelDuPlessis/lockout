@@ -1,6 +1,6 @@
-use hazardous::{AtomicPtr, Domain};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use lockout_hazard::{AtomicPtr, Domain};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 static DOMAIN: Domain = Domain::new();
@@ -226,7 +226,9 @@ fn replaced_from_swap() {
     let ptr = AtomicPtr::from_box(Box::new(42));
 
     // swap returns Replaced
-    let replaced = ptr.swap(Box::into_raw(Box::new(99)), Ordering::SeqCst).unwrap();
+    let replaced = ptr
+        .swap(Box::into_raw(Box::new(99)), Ordering::SeqCst)
+        .unwrap();
     replaced.retire(&domain);
 
     // swap with null returns the last value
