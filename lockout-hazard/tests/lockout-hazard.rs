@@ -25,9 +25,7 @@ fn protect_and_deref() {
     assert_eq!(*guard, 42);
     guard.clear();
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }
 
@@ -51,9 +49,7 @@ fn guard_clear_releases_slot() {
     let guard = domain.protect(&ptr).unwrap();
     guard.clear();
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }
 
@@ -66,9 +62,7 @@ fn guard_drop_releases_slot() {
         let _guard = domain.protect(&ptr).unwrap();
     }
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }
 
@@ -80,9 +74,7 @@ fn retire_with_guard() {
     let guard = domain.protect(&ptr).unwrap();
     assert_eq!(*guard, 77);
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     guard.clear();
     domain.collect();
 }
@@ -94,20 +86,15 @@ fn collect_does_not_reclaim_protected_pointer() {
 
     let guard = domain.protect(&ptr).unwrap();
 
-    // Swap in a new value, retire the old one while it's still protected
     let new_val = Box::into_raw(Box::new(456));
-    ptr.swap(new_val, Ordering::SeqCst).unwrap().retire(&domain);
+    ptr.swap(new_val, Ordering::SeqCst).retire(&domain);
     domain.collect();
 
-    // Should still be readable through the guard
     assert_eq!(*guard, 123);
     guard.clear();
     domain.collect();
 
-    // Clean up new_val
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }
 
@@ -129,7 +116,6 @@ fn concurrent_protect_and_retire() {
 
     let mut handles = Vec::new();
 
-    // Spawn readers
     for _ in 0..4 {
         let domain = domain.clone();
         let shared = shared.clone();
@@ -143,7 +129,6 @@ fn concurrent_protect_and_retire() {
         }));
     }
 
-    // Spawn writers
     for _ in 0..2 {
         let domain = domain.clone();
         let shared = shared.clone();
@@ -151,9 +136,7 @@ fn concurrent_protect_and_retire() {
         handles.push(thread::spawn(move || {
             for _ in 0..50 {
                 let new = Box::into_raw(Box::new(Tracked(drop_count.clone())));
-                if let Some(old) = shared.swap(new, Ordering::AcqRel) {
-                    old.retire(&domain);
-                }
+                shared.swap(new, Ordering::AcqRel).retire(&domain);
             }
         }));
     }
@@ -162,13 +145,9 @@ fn concurrent_protect_and_retire() {
         h.join().unwrap();
     }
 
-    // Final cleanup
-    if let Some(last) = shared.swap(std::ptr::null_mut(), Ordering::Relaxed) {
-        last.retire(&domain);
-    }
+    shared.swap(std::ptr::null_mut(), Ordering::Relaxed).retire(&domain);
     domain.collect();
 
-    // 1 initial + 100 swaps = 101 total allocations, all should be dropped
     assert_eq!(drop_count.load(Ordering::Relaxed), 101);
 }
 
@@ -187,14 +166,8 @@ fn multiple_guards_same_domain() {
     guard_a.clear();
     guard_b.clear();
 
-    ptr_a
-        .swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
-    ptr_b
-        .swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr_a.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr_b.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }
 
@@ -210,13 +183,10 @@ fn domain_drop_frees_nodes() {
     }
 
     for p in &ptrs {
-        p.swap(std::ptr::null_mut(), Ordering::SeqCst)
-            .unwrap()
-            .retire(&domain);
+        p.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     }
     domain.collect();
 
-    // Domain drop should free all hazard list nodes without leaking
     drop(domain);
 }
 
@@ -225,18 +195,11 @@ fn replaced_from_swap() {
     let domain = Domain::new();
     let ptr = AtomicPtr::from_box(Box::new(42));
 
-    // swap returns Replaced
-    let replaced = ptr
-        .swap(Box::into_raw(Box::new(99)), Ordering::SeqCst)
-        .unwrap();
-    replaced.retire(&domain);
+    ptr.swap(Box::into_raw(Box::new(99)), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
 
-    // swap with null returns the last value
-    let replaced = ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).unwrap();
-    replaced.retire(&domain);
-
-    // swap on null returns None
-    assert!(ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).is_none());
+    // swap on null — retire is a no-op
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
 
     domain.collect();
 }
@@ -249,9 +212,10 @@ fn replaced_from_compare_exchange() {
 
     let new_val = Box::into_raw(Box::new(99));
 
-    // Successful CAS returns Ok(Some(Replaced))
-    let result = ptr.compare_exchange(val, new_val, Ordering::SeqCst, Ordering::SeqCst);
-    result.unwrap().unwrap().retire(&domain);
+    // Successful CAS returns Ok(Replaced)
+    ptr.compare_exchange(val, new_val, Ordering::SeqCst, Ordering::SeqCst)
+        .unwrap()
+        .retire(&domain);
 
     // Failed CAS returns Err with current value
     let wrong = std::ptr::null_mut();
@@ -259,8 +223,6 @@ fn replaced_from_compare_exchange() {
     assert!(result.is_err());
 
     // Clean up
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
-        .unwrap()
-        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
     domain.collect();
 }

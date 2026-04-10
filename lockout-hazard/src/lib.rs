@@ -20,13 +20,12 @@
 //! assert_eq!(*guard, 42);
 //!
 //! // Swap in a new value — returns a Replaced that must be retired.
-//! let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst).unwrap();
+//! let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst);
 //! guard.clear();
 //! old.retire(&DOMAIN);
 //!
 //! // Clean up the remaining allocation.
-//! let last = shared.swap(std::ptr::null_mut(), Ordering::SeqCst).unwrap();
-//! last.retire(&DOMAIN);
+//! shared.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&DOMAIN);
 //! DOMAIN.collect();
 //! ```
 
@@ -70,15 +69,26 @@ struct RetiredNode {
 ///
 /// Dropping a `Replaced` without retiring it will leak the allocation.
 pub struct Replaced<T> {
-    ptr: NonNull<T>,
+    ptr: Option<NonNull<T>>,
 }
 
 impl<T> Replaced<T> {
     /// Retires this pointer, scheduling it for deferred reclamation.
     ///
     /// The pointed-to value will be deallocated once no hazard slot references it.
+    /// Does nothing if the displaced pointer was null.
     pub fn retire(self, domain: &Domain) {
-        unsafe { domain.retire_ptr(self.ptr.as_ptr()) };
+        if let Some(ptr) = self.ptr {
+            unsafe { domain.retire_ptr(ptr.as_ptr()) };
+        }
+        std::mem::forget(self);
+    }
+
+    /// Deliberately discards this `Replaced` without retiring it.
+    ///
+    /// Use this when the old pointer is still reachable (e.g. from another
+    /// atomic) and should not be reclaimed.
+    pub fn forget(self) {
         std::mem::forget(self);
     }
 }
@@ -115,11 +125,16 @@ impl<T> AtomicPtr<T> {
         Self::new(Box::into_raw(val))
     }
 
+    /// Atomically loads the raw pointer.
+    pub fn load(&self, order: Ordering) -> *mut T {
+        self.inner.load(order)
+    }
+
     /// Atomically swaps the pointer, returning the old value as a [`Replaced<T>`]
-    /// that must be retired. Returns `None` if the old pointer was null.
-    pub fn swap(&self, new: *mut T, order: Ordering) -> Option<Replaced<T>> {
+    /// that must be retired.
+    pub fn swap(&self, new: *mut T, order: Ordering) -> Replaced<T> {
         let old = self.inner.swap(new, order);
-        NonNull::new(old).map(|ptr| Replaced { ptr })
+        Replaced { ptr: NonNull::new(old) }
     }
 
     /// Atomically compares and exchanges the pointer. On success, returns
@@ -131,10 +146,10 @@ impl<T> AtomicPtr<T> {
         new: *mut T,
         success: Ordering,
         failure: Ordering,
-    ) -> Result<Option<Replaced<T>>, *mut T> {
+    ) -> Result<Replaced<T>, *mut T> {
         self.inner
             .compare_exchange(current, new, success, failure)
-            .map(|old| NonNull::new(old).map(|ptr| Replaced { ptr }))
+            .map(|old| Replaced { ptr: NonNull::new(old) })
     }
 }
 
@@ -176,6 +191,11 @@ impl<'a, T> Guard<'a, T> {
     /// Returns a reference to the protected value.
     pub fn get(&self) -> &T {
         unsafe { &*self.ptr }
+    }
+
+    /// Returns the underlying raw pointer.
+    pub fn as_raw(&self) -> *mut T {
+        self.ptr
     }
 
     fn set_null(&self) {
