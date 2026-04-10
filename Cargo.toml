@@ -1,3 +1,3 @@
 [workspace]
-members = ["lockout-hazard"]
+members = ["lockout-channel","lockout-hazard"]
 resolver = "3"
