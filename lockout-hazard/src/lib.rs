@@ -411,16 +411,6 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
         }
     }
 
-    /// Retires the pointer held by `guard`, scheduling it for deferred reclamation.
-    ///
-    /// The guard is consumed, releasing its hazard slot. The caller must ensure
-    /// the pointer is no longer reachable through any shared atomic before calling this.
-    pub fn retire<T>(&self, guard: Guard<'_, T>) {
-        // Safety: the guard proves the pointer was obtained through protect,
-        // and the caller is responsible for ensuring it's no longer reachable.
-        unsafe { self.retire_ptr::<T>(guard.ptr) };
-    }
-
     /// Retires a raw pointer, scheduling it for deferred reclamation.
     ///
     /// The pointer will be deallocated (via `Box::from_raw`) once no hazard slot
