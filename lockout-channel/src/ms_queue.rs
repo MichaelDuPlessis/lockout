@@ -91,7 +91,7 @@ impl<T: Send + Sync> Queue<T> {
                 }
             } else {
                 // Tail is current — try to link the new node.
-                if tail
+                if let Ok(old_null) = tail
                     .next
                     .compare_exchange(
                         std::ptr::null_mut(),
@@ -99,8 +99,8 @@ impl<T: Send + Sync> Queue<T> {
                         Ordering::Release,
                         Ordering::Relaxed,
                     )
-                    .is_ok()
                 {
+                    old_null.forget();
                     // Try to advance tail to the new node.
                     if let Ok(replaced) = self.tail.compare_exchange(
                         tail.as_raw(),
@@ -176,3 +176,130 @@ impl<T> Drop for Queue<T> {
 // Safety: All shared access uses atomic operations and hazard pointers.
 unsafe impl<T: Send + Sync> Send for Queue<T> {}
 unsafe impl<T: Send + Sync> Sync for Queue<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    #[test]
+    fn dequeue_empty() {
+        let q = Queue::<i32>::new();
+        assert!(q.dequeue().is_none());
+    }
+
+    #[test]
+    fn enqueue_dequeue_single() {
+        let q = Queue::new();
+        q.enqueue(42);
+        assert_eq!(q.dequeue(), Some(42));
+        assert!(q.dequeue().is_none());
+    }
+
+    #[test]
+    fn fifo_order() {
+        let q = Queue::new();
+        for i in 0..10 {
+            q.enqueue(i);
+        }
+        for i in 0..10 {
+            assert_eq!(q.dequeue(), Some(i));
+        }
+        assert!(q.dequeue().is_none());
+    }
+
+    #[test]
+    fn drop_with_remaining_items() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        {
+            let q = Queue::new();
+            for _ in 0..5 {
+                q.enqueue(Tracked(drop_count.clone()));
+            }
+        }
+
+        assert_eq!(drop_count.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn concurrent_enqueue_dequeue() {
+        let q = Arc::new(Queue::new());
+        let count = 1000;
+        let producers = 4;
+        let consumers = 4;
+
+        let mut handles = Vec::new();
+
+        for _ in 0..producers {
+            let q = q.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..count {
+                    q.enqueue(i);
+                }
+            }));
+        }
+
+        let total_dequeued = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..consumers {
+            let q = q.clone();
+            let total_dequeued = total_dequeued.clone();
+            handles.push(thread::spawn(move || {
+                loop {
+                    if q.dequeue().is_some() {
+                        total_dequeued.fetch_add(1, Ordering::Relaxed);
+                    } else if total_dequeued.load(Ordering::Relaxed) >= producers * count {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(total_dequeued.load(Ordering::Relaxed), producers * count);
+    }
+
+    #[test]
+    fn concurrent_no_duplicates() {
+        let q = Arc::new(Queue::new());
+        let count = 500;
+        let producers = 4;
+
+        let mut handles = Vec::new();
+
+        for p in 0..producers {
+            let q = q.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..count {
+                    q.enqueue(p * count + i);
+                }
+            }));
+        }
+
+        for h in handles.drain(..) {
+            h.join().unwrap();
+        }
+
+        let mut results = Vec::new();
+        while let Some(v) = q.dequeue() {
+            results.push(v);
+        }
+
+        results.sort();
+        let expected: Vec<usize> = (0..producers * count).collect();
+        assert_eq!(results, expected);
+    }
+}
