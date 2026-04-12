@@ -29,11 +29,12 @@
 //! DOMAIN.collect();
 //! ```
 
-use std::{
-    ops::Deref,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr as StdAtomicPtr, AtomicU8, Ordering},
-};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicPtr as StdAtomicPtr, AtomicU8, AtomicUsize};
+use std::{ops::Deref, ptr::NonNull, sync::atomic::Ordering};
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicPtr as StdAtomicPtr, AtomicU8, AtomicUsize};
 
 /// Number of retires before an automatic collection is triggered.
 const DEFAULT_COLLECTION_THRESHOLD: u8 = 8;
@@ -46,7 +47,16 @@ struct HazardNode {
 }
 
 impl HazardNode {
+    #[cfg(not(loom))]
     const fn new(ptr: *mut ()) -> Self {
+        Self {
+            hazard: StdAtomicPtr::new(ptr),
+            next: StdAtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    #[cfg(loom)]
+    fn new(ptr: *mut ()) -> Self {
         Self {
             hazard: StdAtomicPtr::new(ptr),
             next: StdAtomicPtr::new(std::ptr::null_mut()),
@@ -114,7 +124,15 @@ pub struct AtomicPtr<T> {
 
 impl<T> AtomicPtr<T> {
     /// Creates a new `AtomicPtr` from a raw pointer.
+    #[cfg(not(loom))]
     pub const fn new(ptr: *mut T) -> Self {
+        Self {
+            inner: StdAtomicPtr::new(ptr),
+        }
+    }
+
+    #[cfg(loom)]
+    pub fn new(ptr: *mut T) -> Self {
         Self {
             inner: StdAtomicPtr::new(ptr),
         }
@@ -134,7 +152,9 @@ impl<T> AtomicPtr<T> {
     /// that must be retired.
     pub fn swap(&self, new: *mut T, order: Ordering) -> Replaced<T> {
         let old = self.inner.swap(new, order);
-        Replaced { ptr: NonNull::new(old) }
+        Replaced {
+            ptr: NonNull::new(old),
+        }
     }
 
     /// Atomically compares and exchanges the pointer. On success, returns
@@ -149,7 +169,9 @@ impl<T> AtomicPtr<T> {
     ) -> Result<Replaced<T>, *mut T> {
         self.inner
             .compare_exchange(current, new, success, failure)
-            .map(|old| Replaced { ptr: NonNull::new(old) })
+            .map(|old| Replaced {
+                ptr: NonNull::new(old),
+            })
     }
 }
 
@@ -241,6 +263,7 @@ impl<T> Drop for Guard<'_, T> {
 #[derive(Debug)]
 pub struct Domain<const COLLECTION_THRESHOLD: u8 = DEFAULT_COLLECTION_THRESHOLD> {
     hazard_list: HazardNode,
+    hazard_count: AtomicUsize,
     retired_head: StdAtomicPtr<RetiredNode>,
     retire_count: AtomicU8,
 }
@@ -279,7 +302,13 @@ impl Domain {
     /// Creates a new hazard pointer domain.
     ///
     /// This is a `const fn`, so it can be used in `static` declarations.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self::with_threshold()
+    }
+
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self::with_threshold()
     }
 }
@@ -288,9 +317,21 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
     /// Creates a new hazard pointer domain with a threshold for automatic pointer reclamation specified as a generic parameter.
     ///
     /// This is a `const fn`, so it can be used in `static` declarations.
+    #[cfg(not(loom))]
     pub const fn with_threshold() -> Self {
         Self {
             hazard_list: HazardNode::new(std::ptr::null_mut()),
+            hazard_count: AtomicUsize::new(1),
+            retired_head: StdAtomicPtr::new(std::ptr::null_mut()),
+            retire_count: AtomicU8::new(0),
+        }
+    }
+
+    #[cfg(loom)]
+    pub fn with_threshold() -> Self {
+        Self {
+            hazard_list: HazardNode::new(std::ptr::null_mut()),
+            hazard_count: AtomicUsize::new(1),
             retired_head: StdAtomicPtr::new(std::ptr::null_mut()),
             retire_count: AtomicU8::new(0),
         }
@@ -323,6 +364,9 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
             if ptr_after == ptr_before {
                 return Some(guard);
             }
+
+            #[cfg(loom)]
+            loom::thread::yield_now();
         }
     }
 
@@ -366,6 +410,8 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
             let next = current.next.load(Ordering::Acquire);
             if !next.is_null() {
                 current = unsafe { next.as_ref().unwrap_unchecked() };
+                #[cfg(loom)]
+                loom::thread::yield_now();
                 continue;
             }
 
@@ -377,6 +423,7 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.hazard_count.fetch_add(1, Ordering::SeqCst);
                     return Guard::new(
                         unsafe { &new_node.as_ref().unwrap_unchecked().hazard },
                         ptr,
@@ -391,6 +438,8 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
                             .as_ref()
                             .unwrap_unchecked()
                     };
+                    #[cfg(loom)]
+                    loom::thread::yield_now();
                 }
             }
         }
@@ -408,6 +457,8 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
             {
                 return;
             }
+            #[cfg(loom)]
+            loom::thread::yield_now();
         }
     }
 
@@ -447,25 +498,41 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
     pub fn collect(&self) {
         self.retire_count.store(0, Ordering::Relaxed);
 
-        // Snapshot all active hazard pointers.
-        let mut hazard_ptrs = Vec::new();
-        let mut current = &self.hazard_list;
-        loop {
-            let ptr = current.hazard.load(Ordering::SeqCst);
-            if !ptr.is_null() {
-                hazard_ptrs.push(ptr);
-            }
-            let next = current.next.load(Ordering::Acquire);
-            if next.is_null() {
-                break;
-            }
-            current = unsafe { &*next };
-        }
-
-        // Atomically claim the entire retired stack.
+        // Claim retired nodes first so this collection only processes pointers
+        // that were already retired at this point.
         let mut retired = self
             .retired_head
             .swap(std::ptr::null_mut(), Ordering::Acquire);
+        if retired.is_null() {
+            return;
+        }
+
+        // Snapshot all active hazard pointers from a stable hazard-list view.
+        let hazard_ptrs = loop {
+            let expected_nodes = self.hazard_count.load(Ordering::SeqCst);
+            let mut seen_nodes = 0usize;
+            let mut hazard_ptrs = Vec::new();
+            let mut current = &self.hazard_list;
+
+            loop {
+                seen_nodes += 1;
+                let ptr = current.hazard.load(Ordering::SeqCst);
+                if !ptr.is_null() {
+                    hazard_ptrs.push(ptr);
+                }
+
+                let next = current.next.load(Ordering::SeqCst);
+                if next.is_null() {
+                    break;
+                }
+                current = unsafe { &*next };
+            }
+
+            let final_nodes = self.hazard_count.load(Ordering::SeqCst);
+            if seen_nodes == expected_nodes && final_nodes == expected_nodes {
+                break hazard_ptrs;
+            }
+        };
 
         // Walk the claimed list: free unprotected entries, push back protected ones.
         while !retired.is_null() {

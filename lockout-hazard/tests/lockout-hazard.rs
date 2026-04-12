@@ -25,7 +25,8 @@ fn protect_and_deref() {
     assert_eq!(*guard, 42);
     guard.clear();
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
 
@@ -49,7 +50,8 @@ fn guard_clear_releases_slot() {
     let guard = domain.protect(&ptr).unwrap();
     guard.clear();
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
 
@@ -62,7 +64,8 @@ fn guard_drop_releases_slot() {
         let _guard = domain.protect(&ptr).unwrap();
     }
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
 
@@ -74,7 +77,8 @@ fn retire_with_guard() {
     let guard = domain.protect(&ptr).unwrap();
     assert_eq!(*guard, 77);
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     guard.clear();
     domain.collect();
 }
@@ -94,7 +98,8 @@ fn collect_does_not_reclaim_protected_pointer() {
     guard.clear();
     domain.collect();
 
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
 
@@ -145,7 +150,9 @@ fn concurrent_protect_and_retire() {
         h.join().unwrap();
     }
 
-    shared.swap(std::ptr::null_mut(), Ordering::Relaxed).retire(&domain);
+    shared
+        .swap(std::ptr::null_mut(), Ordering::Relaxed)
+        .retire(&domain);
     domain.collect();
 
     assert_eq!(drop_count.load(Ordering::Relaxed), 101);
@@ -166,8 +173,12 @@ fn multiple_guards_same_domain() {
     guard_a.clear();
     guard_b.clear();
 
-    ptr_a.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
-    ptr_b.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr_a
+        .swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
+    ptr_b
+        .swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
 
@@ -183,7 +194,8 @@ fn domain_drop_frees_nodes() {
     }
 
     for p in &ptrs {
-        p.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+        p.swap(std::ptr::null_mut(), Ordering::SeqCst)
+            .retire(&domain);
     }
     domain.collect();
 
@@ -195,11 +207,14 @@ fn replaced_from_swap() {
     let domain = Domain::new();
     let ptr = AtomicPtr::from_box(Box::new(42));
 
-    ptr.swap(Box::into_raw(Box::new(99)), Ordering::SeqCst).retire(&domain);
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(Box::into_raw(Box::new(99)), Ordering::SeqCst)
+        .retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
 
     // swap on null — retire is a no-op
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
 
     domain.collect();
 }
@@ -223,6 +238,7 @@ fn replaced_from_compare_exchange() {
     assert!(result.is_err());
 
     // Clean up
-    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst).retire(&domain);
+    ptr.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        .retire(&domain);
     domain.collect();
 }
