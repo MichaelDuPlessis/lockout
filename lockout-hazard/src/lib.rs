@@ -221,7 +221,7 @@ impl<'a, T> Guard<'a, T> {
     }
 
     fn set_null(&self) {
-        self.slot.store(std::ptr::null_mut(), Ordering::SeqCst);
+        self.slot.store(std::ptr::null_mut(), Ordering::Release);
     }
 
     /// Releases the hazard slot without running the destructor twice.
@@ -282,7 +282,7 @@ impl<const COLLECTION_THRESHOLD: u8> Drop for Domain<COLLECTION_THRESHOLD> {
     fn drop(&mut self) {
         // Free all retired nodes unconditionally — no guards can exist
         // since they borrow the domain.
-        let mut retired = *self.retired_head.get_mut();
+        let mut retired = self.retired_head.load(Ordering::Relaxed);
         while !retired.is_null() {
             let node = unsafe { Box::from_raw(retired) };
             unsafe { (node.deleter)(node.ptr) };
@@ -353,14 +353,14 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
     /// the pointer is null.
     fn protect_atomic<T>(&self, ptr: &StdAtomicPtr<T>) -> Option<Guard<'_, T>> {
         loop {
-            let ptr_before = ptr.load(Ordering::SeqCst);
+            let ptr_before = ptr.load(Ordering::Acquire);
             if ptr_before.is_null() {
                 return None;
             }
 
             let guard = self.reserve(ptr_before);
 
-            let ptr_after = ptr.load(Ordering::SeqCst);
+            let ptr_after = ptr.load(Ordering::Acquire);
             if ptr_after == ptr_before {
                 return Some(guard);
             }
@@ -399,7 +399,7 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
                 .compare_exchange_weak(
                     std::ptr::null_mut(),
                     ptr as *mut (),
-                    Ordering::SeqCst,
+                    Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
                 .is_ok()
@@ -420,10 +420,10 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
                 std::ptr::null_mut(),
                 new_node,
                 Ordering::Release,
-                Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    self.hazard_count.fetch_add(1, Ordering::SeqCst);
+                    self.hazard_count.fetch_add(1, Ordering::Release);
                     return Guard::new(
                         unsafe { &new_node.as_ref().unwrap_unchecked().hazard },
                         ptr,
@@ -509,26 +509,26 @@ impl<const COLLECTION_THRESHOLD: u8> Domain<COLLECTION_THRESHOLD> {
 
         // Snapshot all active hazard pointers from a stable hazard-list view.
         let hazard_ptrs = loop {
-            let expected_nodes = self.hazard_count.load(Ordering::SeqCst);
+            let expected_nodes = self.hazard_count.load(Ordering::Acquire);
             let mut seen_nodes = 0usize;
             let mut hazard_ptrs = Vec::new();
             let mut current = &self.hazard_list;
 
             loop {
                 seen_nodes += 1;
-                let ptr = current.hazard.load(Ordering::SeqCst);
+                let ptr = current.hazard.load(Ordering::Acquire);
                 if !ptr.is_null() {
                     hazard_ptrs.push(ptr);
                 }
 
-                let next = current.next.load(Ordering::SeqCst);
+                let next = current.next.load(Ordering::Acquire);
                 if next.is_null() {
                     break;
                 }
                 current = unsafe { &*next };
             }
 
-            let final_nodes = self.hazard_count.load(Ordering::SeqCst);
+            let final_nodes = self.hazard_count.load(Ordering::Acquire);
             if seen_nodes == expected_nodes && final_nodes == expected_nodes {
                 break hazard_ptrs;
             }
