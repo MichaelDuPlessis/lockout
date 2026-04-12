@@ -127,8 +127,7 @@ impl<T: Send + Sync> Queue<T> {
                 .domain
                 .protect(&self.head)
                 .expect("The queue should never be empty.");
-            let next = head.next.load(Ordering::Acquire);
-            let tail = self.tail.load(Ordering::Acquire);
+            let tail = self.tail.load(Ordering::Relaxed);
 
             if head.as_raw() != tail {
                 // Queue is not empty — try to advance head.
@@ -136,7 +135,7 @@ impl<T: Send + Sync> Queue<T> {
 
                 if let Ok(unlinked_head) = self.head.compare_exchange(
                     head.as_raw(),
-                    next,
+                    guarded_next.as_raw(),
                     Ordering::Release,
                     Ordering::Relaxed,
                 ) {
@@ -144,17 +143,20 @@ impl<T: Send + Sync> Queue<T> {
 
                     return Some(unsafe { guarded_next.data.assume_init_read() });
                 }
-            } else if !next.is_null() {
-                // Help a partial enqueue by advancing tail.
-                if let Ok(replaced) =
-                    self.tail
-                        .compare_exchange(tail, next, Ordering::Release, Ordering::Relaxed)
-                {
-                    replaced.forget();
-                }
             } else {
-                // Queue is empty.
-                return None;
+                let next = head.next.load(Ordering::Acquire);
+
+                if !next.is_null() {
+                    // Help a partial enqueue by advancing tail.
+                    if let Ok(replaced) =
+                        self.tail.compare_exchange(tail, next, Ordering::Release, Ordering::Relaxed)
+                    {
+                        replaced.forget();
+                    }
+                } else {
+                    // Queue is empty.
+                    return None;
+                }
             }
         }
     }
