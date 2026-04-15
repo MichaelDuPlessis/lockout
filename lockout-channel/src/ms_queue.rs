@@ -16,6 +16,7 @@ use std::{mem::MaybeUninit, sync::atomic::Ordering};
 ///
 /// Uses `MaybeUninit` for data because the sentinel node has no initialized value,
 /// and dequeued nodes transfer ownership via `assume_init_read` without double-dropping.
+#[derive(Debug)]
 pub(crate) struct Node<T> {
     data: MaybeUninit<T>,
     next: AtomicPtr<Node<T>>,
@@ -49,6 +50,7 @@ impl<T> Node<T> {
 /// Uses a linked list of nodes with a sentinel (dummy) head node.
 /// Both `head` and `tail` are always non-null, and the queue is empty
 /// when `head == tail`.
+#[derive(Debug)]
 pub(crate) struct Queue<T> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
@@ -67,7 +69,7 @@ impl<T> Queue<T> {
     }
 }
 
-impl<T: Send + Sync> Queue<T> {
+impl<T> Queue<T> {
     /// Enqueues a value at the tail of the queue.
     ///
     /// This operation is lock-free: if a concurrent enqueue is in progress,
@@ -91,15 +93,12 @@ impl<T: Send + Sync> Queue<T> {
                 }
             } else {
                 // Tail is current — try to link the new node.
-                if let Ok(old_null) = tail
-                    .next
-                    .compare_exchange(
-                        std::ptr::null_mut(),
-                        new_node,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
-                {
+                if let Ok(old_null) = tail.next.compare_exchange(
+                    std::ptr::null_mut(),
+                    new_node,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
                     old_null.forget();
                     // Try to advance tail to the new node.
                     if let Ok(replaced) = self.tail.compare_exchange(
@@ -149,7 +148,8 @@ impl<T: Send + Sync> Queue<T> {
                 if !next.is_null() {
                     // Help a partial enqueue by advancing tail.
                     if let Ok(replaced) =
-                        self.tail.compare_exchange(tail, next, Ordering::Release, Ordering::Relaxed)
+                        self.tail
+                            .compare_exchange(tail, next, Ordering::Release, Ordering::Relaxed)
                     {
                         replaced.forget();
                     }
