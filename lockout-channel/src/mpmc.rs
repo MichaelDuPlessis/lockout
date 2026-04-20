@@ -1,8 +1,11 @@
 use crate::ms_queue::Queue;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-    mpsc::SendError,
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{RecvError, SendError},
+    },
+    thread,
 };
 
 #[derive(Debug)]
@@ -18,18 +21,22 @@ impl<T> Inner<T> {
     }
 
     fn sender_count(&self) -> usize {
-        self.reciever_count.load(Ordering::Relaxed)
+        self.sender_count.load(Ordering::Relaxed)
     }
 
     fn has_recievers(&self) -> bool {
         self.reciever_count() > 0
     }
 
-    fn increment_sender(&self) {
-        self.sender_count.fetch_add(1, Ordering::Relaxed);
+    fn has_senders(&self) -> bool {
+        self.sender_count() > 0
     }
 
     fn increment_reciever(&self) {
+        self.reciever_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_sender(&self) {
         self.sender_count.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -48,7 +55,8 @@ impl<T> Sender<T> {
         if !self.inner.has_recievers() {
             Err(SendError(msg))
         } else {
-            Ok(self.inner.queue.enqueue(msg))
+            self.inner.queue.enqueue(msg);
+            Ok(())
         }
     }
 }
@@ -70,12 +78,26 @@ impl<T> Reciever<T> {
     fn new(inner: Arc<Inner<T>>) -> Self {
         Self { inner }
     }
+
+    pub fn recv(&self) -> Result<T, RecvError> {
+        loop {
+            if !self.inner.has_senders() {
+                return Err(RecvError);
+            }
+
+            if let Some(msg) = self.inner.queue.dequeue() {
+                return Ok(msg);
+            }
+
+            thread::park();
+        }
+    }
 }
 
 pub fn channel<T>() -> (Sender<T>, Reciever<T>) {
     let inner = Arc::new(Inner {
-        sender_count: AtomicUsize::new(0),
-        reciever_count: AtomicUsize::new(0),
+        sender_count: AtomicUsize::new(1),
+        reciever_count: AtomicUsize::new(1),
         queue: Queue::new(),
     });
 
