@@ -145,6 +145,15 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.inner.decrement_sender();
+
+        // if no more senders we need wake all recievers that are waiting
+        if !self.inner.has_senders() {
+            while let Some(waiter) = self.inner.waiters.pop() {
+                if WaiterState::from(waiter.state.load(Ordering::Relaxed)) == WaiterState::Waiting {
+                    waiter.thread.unpark();
+                }
+            }
+        }
     }
 }
 
