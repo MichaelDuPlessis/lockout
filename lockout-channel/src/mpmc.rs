@@ -87,6 +87,14 @@ impl<T> Inner<T> {
     fn increment_sender(&self) {
         self.sender_count.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn decrement_reciever(&self) {
+        self.reciever_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn decrement_sender(&self) {
+        self.sender_count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -131,6 +139,12 @@ impl<T> Clone for Sender<T> {
         self.inner.increment_sender();
 
         Self::new(Arc::clone(&self.inner))
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        self.inner.decrement_sender();
     }
 }
 
@@ -189,6 +203,12 @@ impl<T> Clone for Reciever<T> {
         self.inner.increment_reciever();
 
         Self::new(Arc::clone(&self.inner))
+    }
+}
+
+impl<T> Drop for Reciever<T> {
+    fn drop(&mut self) {
+        self.inner.decrement_reciever();
     }
 }
 
