@@ -17,6 +17,12 @@ enum WaiterState {
     Cancelled,
 }
 
+impl WaiterState {
+    fn is_waiting(&self) -> bool {
+        *self == Self::Waiting
+    }
+}
+
 impl From<WaiterState> for u8 {
     fn from(value: WaiterState) -> Self {
         value as u8
@@ -100,11 +106,28 @@ impl<T> Sender<T> {
     }
 
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        if !self.inner.has_recievers() {
-            Err(SendError(msg))
-        } else {
+        if self.inner.has_recievers() {
             self.inner.messages.enqueue(msg);
+
+            while let Some(waiter) = self.inner.waiters.pop() {
+                if waiter
+                    .state
+                    .compare_exchange(
+                        WaiterState::Waiting.into(),
+                        WaiterState::Notified.into(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    waiter.thread.unpark();
+                    break;
+                }
+            }
+
             Ok(())
+        } else {
+            Err(SendError(msg))
         }
     }
 }
@@ -164,6 +187,14 @@ impl<T> Reciever<T> {
                 }
             }
         }
+    }
+}
+
+impl<T> Clone for Reciever<T> {
+    fn clone(&self) -> Self {
+        self.inner.increment_reciever();
+
+        Self::new(Arc::clone(&self.inner))
     }
 }
 
