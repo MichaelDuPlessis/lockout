@@ -34,12 +34,12 @@ impl<T> Node<T> {
 
 /// A lock-free LIFO stack.
 #[derive(Debug)]
-pub(crate) struct TreiberStack<T> {
+pub(crate) struct Stack<T> {
     head: AtomicPtr<Node<T>>,
     domain: Domain,
 }
 
-impl<T> TreiberStack<T> {
+impl<T> Stack<T> {
     pub(crate) fn new() -> Self {
         Self {
             head: AtomicPtr::new(std::ptr::null_mut()),
@@ -73,12 +73,10 @@ impl<T> TreiberStack<T> {
             let head = self.domain.protect(&self.head)?;
             let next = head.next.load(Ordering::Acquire);
 
-            if let Ok(unlinked_head) = self.head.compare_exchange(
-                head.as_raw(),
-                next,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            if let Ok(unlinked_head) =
+                self.head
+                    .compare_exchange(head.as_raw(), next, Ordering::AcqRel, Ordering::Relaxed)
+            {
                 let value = unsafe { head.data.assume_init_read() };
                 unlinked_head.retire(&self.domain);
                 return Some(value);
@@ -87,7 +85,7 @@ impl<T> TreiberStack<T> {
     }
 }
 
-impl<T> Drop for TreiberStack<T> {
+impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
         let mut current = self.head.load(Ordering::Relaxed);
 
@@ -100,8 +98,8 @@ impl<T> Drop for TreiberStack<T> {
 }
 
 // Safety: All shared access uses atomic operations and hazard pointers.
-unsafe impl<T: Send + Sync> Send for TreiberStack<T> {}
-unsafe impl<T: Send + Sync> Sync for TreiberStack<T> {}
+unsafe impl<T: Send + Sync> Send for Stack<T> {}
+unsafe impl<T: Send + Sync> Sync for Stack<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -112,13 +110,13 @@ mod tests {
 
     #[test]
     fn pop_empty() {
-        let s = TreiberStack::<i32>::new();
+        let s = Stack::<i32>::new();
         assert!(s.pop().is_none());
     }
 
     #[test]
     fn push_pop_single() {
-        let s = TreiberStack::new();
+        let s = Stack::new();
         s.push(42);
         assert_eq!(s.pop(), Some(42));
         assert!(s.pop().is_none());
@@ -126,7 +124,7 @@ mod tests {
 
     #[test]
     fn lifo_order() {
-        let s = TreiberStack::new();
+        let s = Stack::new();
         for i in 0..10 {
             s.push(i);
         }
@@ -148,7 +146,7 @@ mod tests {
         }
 
         {
-            let s = TreiberStack::new();
+            let s = Stack::new();
             for _ in 0..5 {
                 s.push(Tracked(drop_count.clone()));
             }
@@ -159,7 +157,7 @@ mod tests {
 
     #[test]
     fn concurrent_push_pop_count() {
-        let s = Arc::new(TreiberStack::new());
+        let s = Arc::new(Stack::new());
         let producers = 4;
         let consumers = 4;
         let count = 1000;
@@ -203,7 +201,7 @@ mod tests {
 
     #[test]
     fn concurrent_no_duplicates() {
-        let s = Arc::new(TreiberStack::new());
+        let s = Arc::new(Stack::new());
         let producers = 4;
         let count = 500;
 

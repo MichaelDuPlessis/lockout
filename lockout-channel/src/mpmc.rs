@@ -1,18 +1,66 @@
-use crate::ms_queue::Queue;
+use crate::{ms_queue::Queue, treiber_stack::Stack};
 use std::{
+    hint::unreachable_unchecked,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         mpsc::{RecvError, SendError},
     },
-    thread,
+    thread::{self, Thread},
 };
+
+#[derive(Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum WaiterState {
+    Waiting,
+    Notified,
+    Cancelled,
+}
+
+impl From<WaiterState> for u8 {
+    fn from(value: WaiterState) -> Self {
+        value as u8
+    }
+}
+
+impl From<WaiterState> for AtomicU8 {
+    fn from(value: WaiterState) -> Self {
+        Self::new(value.into())
+    }
+}
+
+impl From<u8> for WaiterState {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => WaiterState::Waiting,
+            1 => WaiterState::Notified,
+            2 => WaiterState::Cancelled,
+            _ => panic!("This should never be reachable WaiterState can only be 0, 1, 2."),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Waiter {
+    state: AtomicU8,
+    thread: Thread,
+}
+
+impl Waiter {
+    fn new(state: WaiterState) -> Self {
+        Self {
+            state: state.into(),
+            thread: thread::current(),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Inner<T> {
     sender_count: AtomicUsize,
     reciever_count: AtomicUsize,
-    queue: Queue<T>,
+    messages: Queue<T>,
+    waiters: Stack<Arc<Waiter>>,
 }
 
 impl<T> Inner<T> {
@@ -55,7 +103,7 @@ impl<T> Sender<T> {
         if !self.inner.has_recievers() {
             Err(SendError(msg))
         } else {
-            self.inner.queue.enqueue(msg);
+            self.inner.messages.enqueue(msg);
             Ok(())
         }
     }
@@ -81,15 +129,40 @@ impl<T> Reciever<T> {
 
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
+            // try to dequeue a message otherwise put in waiting list
+            if let Some(msg) = self.inner.messages.dequeue() {
+                return Ok(msg);
+            }
+
             if !self.inner.has_senders() {
                 return Err(RecvError);
             }
 
-            if let Some(msg) = self.inner.queue.dequeue() {
-                return Ok(msg);
-            }
+            // TODO: Investigate if this should be an Arc
+            let waiter = Arc::new(Waiter::new(WaiterState::Waiting));
+            self.inner.waiters.push(Arc::clone(&waiter));
 
-            thread::park();
+            loop {
+                // just double check there tehre is nothing
+                if let Some(msg) = self.inner.messages.dequeue() {
+                    waiter
+                        .state
+                        .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
+                    return Ok(msg);
+                }
+
+                if !self.inner.has_senders() {
+                    return Err(RecvError);
+                }
+
+                // if still waiting park
+                let state = WaiterState::from(waiter.state.load(Ordering::Relaxed));
+                match state {
+                    WaiterState::Waiting => thread::park(),
+                    WaiterState::Notified => break,
+                    _ => unsafe { unreachable_unchecked() },
+                }
+            }
         }
     }
 }
@@ -98,7 +171,8 @@ pub fn channel<T>() -> (Sender<T>, Reciever<T>) {
     let inner = Arc::new(Inner {
         sender_count: AtomicUsize::new(1),
         reciever_count: AtomicUsize::new(1),
-        queue: Queue::new(),
+        messages: Queue::new(),
+        waiters: Stack::new(),
     });
 
     let sender = Sender::new(Arc::clone(&inner));
