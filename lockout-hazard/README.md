@@ -1,55 +1,59 @@
-# hazardous
+# lockout-hazard
 
-A lock-free hazard pointer library for safe memory reclamation in Rust.
+Lock-free hazard pointers for safe memory reclamation in concurrent Rust data structures.
 
-## What are hazard pointers?
+## Why hazard pointers?
 
-Hazard pointers were introduced by Maged Michael and solve the problem of safely reclaiming memory in lock-free data structures. When multiple threads share pointers to heap-allocated objects, a thread removing an object can't immediately free it — another thread might still be reading it. Hazard pointers let readers announce which pointers they're accessing, so writers defer reclamation until it's safe.
+When one thread unlinks a node from a lock-free structure, other threads may still hold transient references to that node. Freeing immediately can cause use-after-free. Hazard pointers solve this by:
+
+1. Letting readers publish protected pointers in hazard slots.
+2. Deferring reclamation of retired nodes until no hazard slot references them.
 
 ## Usage
 
 ```rust
-use std::sync::atomic::{AtomicPtr, Ordering};
-use hazardous::Domain;
+use lockout_hazard::{AtomicPtr, Domain};
+use std::sync::atomic::Ordering;
 
 static DOMAIN: Domain = Domain::new();
 
-// Shared pointer to some data
-let shared = AtomicPtr::new(Box::into_raw(Box::new(42)));
+let shared = AtomicPtr::from_box(Box::new(42));
 
-// Reader: protect the pointer before reading
 let guard = DOMAIN.protect(&shared).unwrap();
 assert_eq!(*guard, 42);
 
-// Writer: swap in a new value, retire the old one
-let old = shared.swap(Box::into_raw(Box::new(100)), Ordering::SeqCst);
-guard.clear();
-DOMAIN.retire_ptr::<i32>(old);
+// Replace and retire old pointer.
+shared
+    .swap(Box::into_raw(Box::new(100)), Ordering::SeqCst)
+    .retire(&DOMAIN);
 
-// Reclaim retired pointers not currently protected
+guard.clear();
+DOMAIN.collect();
+
+// Final cleanup of current pointer.
+shared
+    .swap(std::ptr::null_mut(), Ordering::SeqCst)
+    .retire(&DOMAIN);
 DOMAIN.collect();
 ```
 
-## Design
+## Core types
 
-- **Lock-free**: All operations (protect, retire, collect) are lock-free using atomic CAS operations
-- **Treiber stack**: Retired pointers are stored in a lock-free intrusive stack within the domain — no thread-local state, no leaks on thread exit
-- **Automatic collection**: `collect()` is triggered automatically every 8 retires, or can be called manually
-- **`const` constructable**: `Domain::new()` is `const`, so domains can be declared as `static`
+- `Domain` — owns hazard slots and retired-node reclamation.
+- `AtomicPtr<T>` — managed atomic pointer wrapper that returns `Replaced<T>` from mutation ops.
+- `Guard<'_, T>` — protected reference preventing reclamation while held.
+- `Replaced<T>` — displaced pointer token that must be retired (or intentionally forgotten).
 
-## API
+## Reclamation model
 
-- `Domain::new()` — create a new hazard pointer domain
-- `Domain::protect(&self, ptr: &AtomicPtr<T>)` — protect a shared atomic pointer with a load-verify loop
-- `Domain::protect_ptr(&self, ptr: *mut T)` — protect an arbitrary raw pointer
-- `Domain::retire(guard)` — retire the pointer held by a guard
-- `Domain::retire_ptr::<T>(ptr)` — retire a raw pointer directly
-- `Domain::collect()` — scan hazards and reclaim unprotected retired pointers
-- `Guard::clear()` — explicitly release a hazard slot
-- `Guard` implements `Deref<Target = T>` for ergonomic access
+- Retired pointers are pushed to a lock-free retired stack.
+- `collect()` snapshots active hazards and frees only unprotected retired pointers.
+- Automatic collection is triggered periodically (default threshold: 8 retires).
 
-## Safety contract
+## Safety requirements
 
-The caller must ensure that a pointer passed to `retire` or `retire_ptr` is:
-1. No longer reachable from any shared atomic (i.e., it has been swapped out)
-2. Was originally allocated with `Box`
+For `Domain::retire_ptr::<T>(ptr)` / `Replaced::retire`:
+
+1. Pointer must no longer be reachable from shared atomics.
+2. Pointer must originate from `Box`.
+3. Pointer must not be retired more than once.
