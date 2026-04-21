@@ -1,3 +1,58 @@
+//! Lock-free multi-producer, multi-consumer channel.
+//!
+//! This module provides an unbounded MPMC channel built on:
+//! - a lock-free Michael-Scott queue for message storage, and
+//! - a lock-free waiter stack for parking/unparking blocked receivers.
+//!
+//! # Semantics
+//!
+//! - `send` succeeds while at least one [`Reciever`] is alive.
+//! - `recv` blocks until a message is available, or returns disconnect when all
+//!   [`Sender`] handles are dropped and the queue is empty.
+//! - `try_recv` is non-blocking and returns immediately.
+//! - `recv_timeout` blocks for at most the supplied timeout.
+//!
+//! # Examples
+//!
+//! Basic send/receive:
+//! ```
+//! use lockout_channel::mpmc::channel;
+//!
+//! let (tx, rx) = channel();
+//! tx.send(42).unwrap();
+//! assert_eq!(rx.recv().unwrap(), 42);
+//! ```
+//!
+//! Multi-producer:
+//! ```
+//! use lockout_channel::mpmc::channel;
+//!
+//! let (tx, rx) = channel();
+//! let tx2 = tx.clone();
+//!
+//! tx.send(1).unwrap();
+//! tx2.send(2).unwrap();
+//!
+//! let a = rx.recv().unwrap();
+//! let b = rx.recv().unwrap();
+//! assert!(a == 1 || a == 2);
+//! assert!(b == 1 || b == 2);
+//! assert_ne!(a, b);
+//! ```
+//!
+//! Non-blocking drain:
+//! ```
+//! use lockout_channel::mpmc::channel;
+//!
+//! let (tx, rx) = channel();
+//! tx.send(1).unwrap();
+//! tx.send(2).unwrap();
+//!
+//! let mut v: Vec<_> = rx.try_iter().collect();
+//! v.sort();
+//! assert_eq!(v, vec![1, 2]);
+//! ```
+
 use crate::{ms_queue::Queue, treiber_stack::Stack};
 use std::{
     hint::unreachable_unchecked,
@@ -188,6 +243,9 @@ impl<T> Inner<T> {
 }
 
 #[derive(Debug)]
+/// Sending side of the MPMC channel.
+///
+/// Cloning creates another producer handle that can send concurrently.
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
 }
@@ -197,6 +255,19 @@ impl<T> Sender<T> {
         Self { inner }
     }
 
+    /// Sends a value into the channel.
+    ///
+    /// Returns [`SendError`] with the original value when all receivers have
+    /// been dropped.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send("hello").unwrap();
+    /// assert_eq!(rx.recv().unwrap(), "hello");
+    /// ```
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         self.inner.send(msg)
     }
@@ -226,6 +297,9 @@ impl<T> Drop for Sender<T> {
 }
 
 #[derive(Debug)]
+/// Receiving side of the MPMC channel.
+///
+/// Cloning creates another consumer handle that can receive concurrently.
 pub struct Reciever<T> {
     inner: Arc<Inner<T>>,
 }
@@ -235,6 +309,19 @@ impl<T> Reciever<T> {
         Self { inner }
     }
 
+    /// Receives the next value, blocking until one is available or disconnected.
+    ///
+    /// Returns [`RecvError`] only when all senders are dropped and the channel
+    /// queue is empty.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(7).unwrap();
+    /// assert_eq!(rx.recv().unwrap(), 7);
+    /// ```
     pub fn recv(&self) -> Result<T, RecvError> {
         match self.inner.recv(None) {
             Ok(msg) => Ok(msg),
@@ -243,24 +330,63 @@ impl<T> Reciever<T> {
         }
     }
 
+    /// Attempts to receive without blocking.
+    ///
+    /// Returns:
+    /// - [`TryRecvError::Empty`] if the channel is currently empty but still connected.
+    /// - [`TryRecvError::Disconnected`] if no senders remain and no message is available.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    /// use std::sync::mpsc::TryRecvError;
+    ///
+    /// let (_tx, rx) = channel::<i32>();
+    /// assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    /// ```
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.inner.try_recv()
     }
 
+    /// Receives the next value, waiting up to `timeout`.
+    ///
+    /// Returns [`RecvTimeoutError::Timeout`] when the deadline is reached before
+    /// a value arrives.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    /// use std::sync::mpsc::RecvTimeoutError;
+    /// use std::time::Duration;
+    ///
+    /// let (_tx, rx) = channel::<i32>();
+    /// assert!(matches!(
+    ///     rx.recv_timeout(Duration::from_millis(1)),
+    ///     Err(RecvTimeoutError::Timeout)
+    /// ));
+    /// ```
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         self.inner.recv(Some(Instant::now() + timeout))
     }
 
+    /// Returns a blocking iterator over values received from this channel.
+    ///
+    /// The iterator yields messages until the channel becomes disconnected and
+    /// drained.
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { reciever: self }
     }
 
+    /// Returns a non-blocking iterator over values currently available.
+    ///
+    /// Iteration stops immediately once the channel is observed empty.
     pub fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { reciever: self }
     }
 }
 
 #[derive(Debug)]
+/// Blocking iterator produced by [`Reciever::iter`].
 pub struct Iter<'a, T> {
     reciever: &'a Reciever<T>,
 }
@@ -274,6 +400,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
 }
 
 #[derive(Debug)]
+/// Non-blocking iterator produced by [`Reciever::try_iter`].
 pub struct TryIter<'a, T> {
     reciever: &'a Reciever<T>,
 }
@@ -300,6 +427,16 @@ impl<T> Drop for Reciever<T> {
     }
 }
 
+/// Creates a new multi-producer, multi-consumer channel pair.
+///
+/// # Examples
+/// ```
+/// use lockout_channel::mpmc::channel;
+///
+/// let (tx, rx) = channel();
+/// tx.send(1).unwrap();
+/// assert_eq!(rx.recv().unwrap(), 1);
+/// ```
 pub fn channel<T>() -> (Sender<T>, Reciever<T>) {
     let inner = Arc::new(Inner {
         sender_count: AtomicUsize::new(1),
