@@ -205,6 +205,23 @@ impl<T> Reciever<T> {
             }
         }
     }
+
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter { reciever: self }
+    }
+}
+
+#[derive(Debug)]
+pub struct Iter<'a, T> {
+    reciever: &'a Reciever<T>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reciever.recv().ok()
+    }
 }
 
 impl<T> Clone for Reciever<T> {
