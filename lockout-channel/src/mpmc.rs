@@ -4,9 +4,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU8, AtomicUsize, Ordering},
-        mpsc::{RecvError, SendError},
+        mpsc::{RecvError, RecvTimeoutError, SendError},
     },
     thread::{self, Thread},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -95,23 +96,12 @@ impl<T> Inner<T> {
     fn decrement_sender(&self) {
         self.sender_count.fetch_sub(1, Ordering::Relaxed);
     }
-}
 
-#[derive(Debug)]
-pub struct Sender<T> {
-    inner: Arc<Inner<T>>,
-}
+    fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        if self.has_recievers() {
+            self.messages.enqueue(msg);
 
-impl<T> Sender<T> {
-    fn new(inner: Arc<Inner<T>>) -> Self {
-        Self { inner }
-    }
-
-    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        if self.inner.has_recievers() {
-            self.inner.messages.enqueue(msg);
-
-            while let Some(waiter) = self.inner.waiters.pop() {
+            while let Some(waiter) = self.waiters.pop() {
                 if waiter
                     .state
                     .compare_exchange(
@@ -131,6 +121,74 @@ impl<T> Sender<T> {
         } else {
             Err(SendError(msg))
         }
+    }
+
+    fn recv(&self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
+        loop {
+            // try to dequeue a message otherwise put in waiting list
+            if let Some(msg) = self.messages.dequeue() {
+                return Ok(msg);
+            }
+
+            if !self.has_senders() {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+
+            // TODO: Investigate if this should be an Arc
+            let waiter = Arc::new(Waiter::new(WaiterState::Waiting));
+            self.waiters.push(Arc::clone(&waiter));
+
+            loop {
+                // just double check there tehre is nothing
+                if let Some(msg) = self.messages.dequeue() {
+                    waiter
+                        .state
+                        .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
+                    return Ok(msg);
+                }
+
+                if !self.has_senders() {
+                    return Err(RecvTimeoutError::Disconnected);
+                }
+
+                // if still waiting park
+                let state = WaiterState::from(waiter.state.load(Ordering::Relaxed));
+                match state {
+                    WaiterState::Waiting => {
+                        if let Some(deadline) = deadline {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                waiter
+                                    .state
+                                    .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
+                                return Err(RecvTimeoutError::Timeout);
+                            }
+
+                            thread::park_timeout(deadline.saturating_duration_since(now));
+                        } else {
+                            thread::park();
+                        }
+                    }
+                    WaiterState::Notified => break,
+                    _ => unsafe { unreachable_unchecked() },
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Sender<T> {
+    inner: Arc<Inner<T>>,
+}
+
+impl<T> Sender<T> {
+    fn new(inner: Arc<Inner<T>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        self.inner.send(msg)
     }
 }
 
@@ -168,42 +226,15 @@ impl<T> Reciever<T> {
     }
 
     pub fn recv(&self) -> Result<T, RecvError> {
-        loop {
-            // try to dequeue a message otherwise put in waiting list
-            if let Some(msg) = self.inner.messages.dequeue() {
-                return Ok(msg);
-            }
-
-            if !self.inner.has_senders() {
-                return Err(RecvError);
-            }
-
-            // TODO: Investigate if this should be an Arc
-            let waiter = Arc::new(Waiter::new(WaiterState::Waiting));
-            self.inner.waiters.push(Arc::clone(&waiter));
-
-            loop {
-                // just double check there tehre is nothing
-                if let Some(msg) = self.inner.messages.dequeue() {
-                    waiter
-                        .state
-                        .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
-                    return Ok(msg);
-                }
-
-                if !self.inner.has_senders() {
-                    return Err(RecvError);
-                }
-
-                // if still waiting park
-                let state = WaiterState::from(waiter.state.load(Ordering::Relaxed));
-                match state {
-                    WaiterState::Waiting => thread::park(),
-                    WaiterState::Notified => break,
-                    _ => unsafe { unreachable_unchecked() },
-                }
-            }
+        match self.inner.recv(None) {
+            Ok(msg) => Ok(msg),
+            Err(RecvTimeoutError::Disconnected) => Err(RecvError),
+            Err(RecvTimeoutError::Timeout) => unsafe { unreachable_unchecked() },
         }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        self.inner.recv(Some(Instant::now() + timeout))
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
