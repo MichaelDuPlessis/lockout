@@ -254,6 +254,10 @@ impl<T> Reciever<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { reciever: self }
     }
+
+    pub fn try_iter(&self) -> TryIter<'_, T> {
+        TryIter { reciever: self }
+    }
 }
 
 #[derive(Debug)]
@@ -266,6 +270,19 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.reciever.recv().ok()
+    }
+}
+
+#[derive(Debug)]
+pub struct TryIter<'a, T> {
+    reciever: &'a Reciever<T>,
+}
+
+impl<'a, T> Iterator for TryIter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reciever.try_recv().ok()
     }
 }
 
