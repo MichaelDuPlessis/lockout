@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU8, AtomicUsize, Ordering},
-        mpsc::{RecvError, RecvTimeoutError, SendError},
+        mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError},
     },
     thread::{self, Thread},
     time::{Duration, Instant},
@@ -175,6 +175,16 @@ impl<T> Inner<T> {
             }
         }
     }
+
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        if let Some(msg) = self.messages.dequeue() {
+            Ok(msg)
+        } else if !self.has_senders() {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -231,6 +241,10 @@ impl<T> Reciever<T> {
             Err(RecvTimeoutError::Disconnected) => Err(RecvError),
             Err(RecvTimeoutError::Timeout) => unsafe { unreachable_unchecked() },
         }
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.inner.try_recv()
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
