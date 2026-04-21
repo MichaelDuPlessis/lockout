@@ -17,12 +17,6 @@ enum WaiterState {
     Cancelled,
 }
 
-impl WaiterState {
-    fn is_waiting(&self) -> bool {
-        *self == Self::Waiting
-    }
-}
-
 impl From<WaiterState> for u8 {
     fn from(value: WaiterState) -> Self {
         value as u8
