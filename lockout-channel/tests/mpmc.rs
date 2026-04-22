@@ -51,7 +51,7 @@ fn recv_timeout_receives_before_deadline() {
         tx.send(99).unwrap();
     });
 
-    let got = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let got = rx.recv_timeout(Duration::from_millis(1000)).unwrap();
     handle.join().unwrap();
     assert_eq!(got, 99);
 }

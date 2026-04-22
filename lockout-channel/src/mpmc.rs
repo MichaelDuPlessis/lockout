@@ -198,7 +198,7 @@ impl<T> Inner<T> {
                 if let Some(msg) = self.messages.dequeue() {
                     waiter
                         .state
-                        .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
+                        .store(WaiterState::Cancelled.into(), Ordering::Relaxed);
                     return Ok(msg);
                 }
 
@@ -218,7 +218,7 @@ impl<T> Inner<T> {
                             if now >= deadline {
                                 waiter
                                     .state
-                                    .store(WaiterState::Cancelled as u8, Ordering::Relaxed);
+                                    .store(WaiterState::Cancelled.into(), Ordering::Relaxed);
                                 return Err(RecvTimeoutError::Timeout);
                             }
 
