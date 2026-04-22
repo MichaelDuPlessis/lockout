@@ -136,20 +136,20 @@ impl<T> Inner<T> {
         self.sender_count() > 0
     }
 
-    fn increment_reciever(&self) {
-        self.reciever_count.fetch_add(1, Ordering::Relaxed);
+    fn increment_reciever(&self) -> usize {
+        self.reciever_count.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn increment_sender(&self) {
-        self.sender_count.fetch_add(1, Ordering::Relaxed);
+    fn increment_sender(&self) -> usize {
+        self.sender_count.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn decrement_reciever(&self) {
-        self.reciever_count.fetch_sub(1, Ordering::Relaxed);
+    fn decrement_reciever(&self) -> usize {
+        self.reciever_count.fetch_sub(1, Ordering::Relaxed)
     }
 
-    fn decrement_sender(&self) {
-        self.sender_count.fetch_sub(1, Ordering::Relaxed);
+    fn decrement_sender(&self) -> usize {
+        self.sender_count.fetch_sub(1, Ordering::Relaxed)
     }
 
     fn send(&self, msg: T) -> Result<(), SendError<T>> {
@@ -283,10 +283,10 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.decrement_sender();
+        let senders = self.inner.decrement_sender();
 
         // if no more senders we need wake all recievers that are waiting
-        if !self.inner.has_senders() {
+        if senders == 0 {
             while let Some(waiter) = self.inner.waiters.pop() {
                 if WaiterState::from(waiter.state.load(Ordering::Relaxed)) == WaiterState::Waiting {
                     waiter.thread.unpark();
