@@ -6,7 +6,7 @@
 //!
 //! # Semantics
 //!
-//! - `send` succeeds while at least one [`Reciever`] is alive.
+//! - `send` succeeds while at least one [`Receiver`] is alive.
 //! - `recv` blocks until a message is available, or returns disconnect when all
 //!   [`Sender`] handles are dropped and the queue is empty.
 //! - `try_recv` is non-blocking and returns immediately.
@@ -114,38 +114,38 @@ impl Waiter {
 #[derive(Debug)]
 struct Inner<T> {
     sender_count: AtomicUsize,
-    reciever_count: AtomicUsize,
+    receiver_count: AtomicUsize,
     messages: Queue<T>,
     waiters: Stack<Arc<Waiter>>,
 }
 
 impl<T> Inner<T> {
-    fn reciever_count(&self) -> usize {
-        self.reciever_count.load(Ordering::SeqCst)
+    fn receiver_count(&self) -> usize {
+        self.receiver_count.load(Ordering::SeqCst)
     }
 
     fn sender_count(&self) -> usize {
         self.sender_count.load(Ordering::SeqCst)
     }
 
-    fn has_recievers(&self) -> bool {
-        self.reciever_count() > 0
+    fn has_receivers(&self) -> bool {
+        self.receiver_count() > 0
     }
 
     fn has_senders(&self) -> bool {
         self.sender_count() > 0
     }
 
-    fn increment_reciever(&self) -> usize {
-        self.reciever_count.fetch_add(1, Ordering::SeqCst)
+    fn increment_receiver(&self) -> usize {
+        self.receiver_count.fetch_add(1, Ordering::SeqCst)
     }
 
     fn increment_sender(&self) -> usize {
         self.sender_count.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn decrement_reciever(&self) -> usize {
-        self.reciever_count.fetch_sub(1, Ordering::SeqCst)
+    fn decrement_receiver(&self) -> usize {
+        self.receiver_count.fetch_sub(1, Ordering::SeqCst)
     }
 
     fn decrement_sender(&self) -> usize {
@@ -153,7 +153,7 @@ impl<T> Inner<T> {
     }
 
     fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        if self.has_recievers() {
+        if self.has_receivers() {
             self.messages.enqueue(msg);
 
             while let Some(waiter) = self.waiters.pop() {
@@ -162,7 +162,7 @@ impl<T> Inner<T> {
                     .compare_exchange(
                         WaiterState::Waiting.into(),
                         WaiterState::Notified.into(),
-                        Ordering::Relaxed,
+                        Ordering::Release,
                         Ordering::Relaxed,
                     )
                     .is_ok()
@@ -180,21 +180,21 @@ impl<T> Inner<T> {
 
     fn recv(&self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
         loop {
-            // try to dequeue a message otherwise put in waiting list
             if let Some(msg) = self.messages.dequeue() {
                 return Ok(msg);
             }
 
             if !self.has_senders() {
+                if let Some(msg) = self.messages.dequeue() {
+                    return Ok(msg);
+                }
                 return Err(RecvTimeoutError::Disconnected);
             }
 
-            // TODO: Investigate if this should be an Arc
             let waiter = Arc::new(Waiter::new(WaiterState::Waiting));
             self.waiters.push(Arc::clone(&waiter));
 
             loop {
-                // just double check there tehre is nothing
                 if let Some(msg) = self.messages.dequeue() {
                     waiter
                         .state
@@ -209,8 +209,7 @@ impl<T> Inner<T> {
                     return Err(RecvTimeoutError::Disconnected);
                 }
 
-                // if still waiting park
-                let state = WaiterState::from(waiter.state.load(Ordering::Relaxed));
+                let state = WaiterState::from(waiter.state.load(Ordering::Acquire));
                 match state {
                     WaiterState::Waiting => {
                         if let Some(deadline) = deadline {
@@ -238,6 +237,9 @@ impl<T> Inner<T> {
         if let Some(msg) = self.messages.dequeue() {
             Ok(msg)
         } else if !self.has_senders() {
+            if let Some(msg) = self.messages.dequeue() {
+                return Ok(msg);
+            }
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
@@ -288,10 +290,18 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let senders = self.inner.decrement_sender();
 
-        // if no more senders we need wake all recievers that are waiting
         if senders == 1 {
             while let Some(waiter) = self.inner.waiters.pop() {
-                if WaiterState::from(waiter.state.load(Ordering::Relaxed)) == WaiterState::Waiting {
+                if waiter
+                    .state
+                    .compare_exchange(
+                        WaiterState::Waiting.into(),
+                        WaiterState::Notified.into(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     waiter.thread.unpark();
                 }
             }
@@ -303,11 +313,11 @@ impl<T> Drop for Sender<T> {
 /// Receiving side of the MPMC channel.
 ///
 /// Cloning creates another consumer handle that can receive concurrently.
-pub struct Reciever<T> {
+pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
 }
 
-impl<T> Reciever<T> {
+impl<T> Receiver<T> {
     fn new(inner: Arc<Inner<T>>) -> Self {
         Self { inner }
     }
@@ -377,56 +387,56 @@ impl<T> Reciever<T> {
     /// The iterator yields messages until the channel becomes disconnected and
     /// drained.
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter { reciever: self }
+        Iter { receiver: self }
     }
 
     /// Returns a non-blocking iterator over values currently available.
     ///
     /// Iteration stops immediately once the channel is observed empty.
     pub fn try_iter(&self) -> TryIter<'_, T> {
-        TryIter { reciever: self }
+        TryIter { receiver: self }
     }
 }
 
 #[derive(Debug)]
-/// Blocking iterator produced by [`Reciever::iter`].
+/// Blocking iterator produced by [`Receiver::iter`].
 pub struct Iter<'a, T> {
-    reciever: &'a Reciever<T>,
+    receiver: &'a Receiver<T>,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.reciever.recv().ok()
+        self.receiver.recv().ok()
     }
 }
 
 #[derive(Debug)]
-/// Non-blocking iterator produced by [`Reciever::try_iter`].
+/// Non-blocking iterator produced by [`Receiver::try_iter`].
 pub struct TryIter<'a, T> {
-    reciever: &'a Reciever<T>,
+    receiver: &'a Receiver<T>,
 }
 
 impl<'a, T> Iterator for TryIter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.reciever.try_recv().ok()
+        self.receiver.try_recv().ok()
     }
 }
 
-impl<T> Clone for Reciever<T> {
+impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.inner.increment_reciever();
+        self.inner.increment_receiver();
 
         Self::new(Arc::clone(&self.inner))
     }
 }
 
-impl<T> Drop for Reciever<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.decrement_reciever();
+        self.inner.decrement_receiver();
     }
 }
 
@@ -440,16 +450,16 @@ impl<T> Drop for Reciever<T> {
 /// tx.send(1).unwrap();
 /// assert_eq!(rx.recv().unwrap(), 1);
 /// ```
-pub fn channel<T>() -> (Sender<T>, Reciever<T>) {
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner {
         sender_count: AtomicUsize::new(1),
-        reciever_count: AtomicUsize::new(1),
+        receiver_count: AtomicUsize::new(1),
         messages: Queue::new(),
         waiters: Stack::new(),
     });
 
     let sender = Sender::new(Arc::clone(&inner));
-    let receiver = Reciever::new(inner);
+    let receiver = Receiver::new(inner);
 
     (sender, receiver)
 }
