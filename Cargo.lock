@@ -282,7 +282,7 @@ name = "lockout"
 version = "0.1.0"
 dependencies = [
  "lockout-channel",
- "lockout-hazard",
+ "lockout-hazard 0.1.0",
 ]
 
 [[package]]
@@ -291,12 +291,21 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
- "lockout-hazard",
+ "lockout-hazard 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "lockout-hazard"
 version = "0.1.0"
+dependencies = [
+ "loom",
+]
+
+[[package]]
+name = "lockout-hazard"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24e492e062da6f8832951b3207fda1d46a167b66caa4b113544ddad7e8471392"
 dependencies = [
  "loom",
 ]
