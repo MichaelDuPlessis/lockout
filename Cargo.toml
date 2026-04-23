@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["non-blocking", "lock-free", "atomic"]
 categories = ["concurrency", "data-structures"]
 
+[dependencies]
+lockout-hazard = { path = "lockout-hazard" }
+lockout-channel = { path = "lockout-channel" }
+
 [workspace]
 members = ["lockout-channel","lockout-hazard"]
 resolver = "3"
