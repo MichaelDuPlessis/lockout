@@ -54,6 +54,7 @@
 //! ```
 
 use crate::{ms_queue::Queue, treiber_stack::Stack};
+use std::iter::IntoIterator;
 use std::{
     hint::unreachable_unchecked,
     sync::{
@@ -385,21 +386,57 @@ impl<T> Receiver<T> {
     /// Returns a blocking iterator over values received from this channel.
     ///
     /// The iterator yields messages until the channel becomes disconnected and
-    /// drained.
+    /// drained. Each call to [`next()`](Iterator::next) blocks until a message
+    /// is available or all senders are dropped.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    /// use std::thread;
+    ///
+    /// let (tx, rx) = channel();
+    /// for i in 0..3 {
+    ///     tx.send(i).unwrap();
+    /// }
+    /// drop(tx);
+    ///
+    /// let collected: Vec<_> = rx.iter().collect();
+    /// assert_eq!(collected, vec![0, 1, 2]);
+    /// ```
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { receiver: self }
     }
 
     /// Returns a non-blocking iterator over values currently available.
     ///
-    /// Iteration stops immediately once the channel is observed empty.
+    /// Iteration stops immediately once the channel is observed empty,
+    /// regardless of whether senders remain. Use [`iter()`](Self::iter) for
+    /// a blocking iterator that waits for more messages.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// tx.send(2).unwrap();
+    /// // Don't drop tx yet
+    ///
+    /// let available: Vec<_> = rx.try_iter().collect();
+    /// assert_eq!(available, vec![1, 2]);
+    /// // More messages may arrive before this returns
+    /// ```
     pub fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { receiver: self }
     }
 }
 
-#[derive(Debug)]
 /// Blocking iterator produced by [`Receiver::iter`].
+///
+/// This iterator blocks on each [`next()`](Iterator::next) call until a message
+/// arrives, the sender disconnects, or the channel is drained. It will yield all
+/// messages sent before the last sender is dropped.
+#[derive(Debug)]
 pub struct Iter<'a, T> {
     receiver: &'a Receiver<T>,
 }
@@ -412,8 +449,13 @@ impl<'a, T> Iterator for Iter<'a, T> {
     }
 }
 
-#[derive(Debug)]
 /// Non-blocking iterator produced by [`Receiver::try_iter`].
+///
+/// This iterator returns available messages without blocking. Once the channel
+/// is observed empty, iteration stops. If senders still exist, messages may
+/// arrive after iteration completes—use [`iter()`](Receiver::iter) to wait for
+/// all messages.
+#[derive(Debug)]
 pub struct TryIter<'a, T> {
     receiver: &'a Receiver<T>,
 }
@@ -423,6 +465,19 @@ impl<'a, T> Iterator for TryIter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.receiver.try_recv().ok()
+    }
+}
+
+#[derive(Debug)]
+pub struct IntoIter<T> {
+    receiver: Receiver<T>,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.recv().ok()
     }
 }
 
@@ -437,6 +492,26 @@ impl<T> Clone for Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.inner.decrement_receiver();
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Receiver<T> {
+    type Item = T;
+
+    type IntoIter = Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T> IntoIterator for Receiver<T> {
+    type Item = T;
+
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { receiver: self }
     }
 }
 
