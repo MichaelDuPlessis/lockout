@@ -2,6 +2,12 @@
 name = "lockout-channel"
 version = "0.1.0"
 edition = "2024"
+description = "Lock-free unbounded MPMC channel using hazard pointers"
+license = "MIT"
+repository = "https://github.com/MichaelDuPlessis/lockout"
+keywords = ["channel", "mpmc", "lock-free", "concurrency"]
+categories = ["concurrency", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 lockout-hazard = { path = "../lockout-hazard" }

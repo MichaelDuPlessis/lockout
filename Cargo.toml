@@ -1,3 +1,14 @@
+[package]
+name = "lockout"
+version = "0.1.0"
+edition = "2024"
+description = "A collection of lock-free utilities for Rust"
+license = "MIT"
+repository = "https://github.com/MichaelDuPlessis/lockout"
+readme = "README.md"
+keywords = ["non-blocking", "lock-free", "atomic"]
+categories = ["concurrency", "data-structures"]
+
 [workspace]
 members = ["lockout-channel","lockout-hazard"]
 resolver = "3"

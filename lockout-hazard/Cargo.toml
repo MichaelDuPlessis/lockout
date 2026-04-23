@@ -2,6 +2,12 @@
 name = "lockout-hazard"
 version = "0.1.0"
 edition = "2024"
+description = "Lock-free hazard pointers for safe memory reclamation"
+license = "MIT"
+repository = "https://github.com/MichaelDuPlessis/lockout"
+keywords = ["hazard-pointer", "lock-free", "memory-reclamation"]
+categories = ["concurrency", "data-structures"]
+readme = "README.md"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
