@@ -10,8 +10,8 @@ keywords = ["non-blocking", "lock-free", "atomic"]
 categories = ["concurrency", "data-structures"]
 
 [dependencies]
-lockout-hazard = { path = "lockout-hazard" }
-lockout-channel = { path = "lockout-channel" }
+lockout-hazard = "0.1.0"
+lockout-channel = "0.1.0"
 
 [workspace]
 members = ["lockout-channel","lockout-hazard"]
