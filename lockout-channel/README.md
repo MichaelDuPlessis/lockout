@@ -31,15 +31,15 @@ assert_eq!(rx.recv().unwrap(), "hello");
 
 ### Consumer
 
-- `Reciever::recv() -> Result<T, RecvError>`
+- `Receiver::recv() -> Result<T, RecvError>`
   - Blocking receive.
-- `Reciever::try_recv() -> Result<T, TryRecvError>`
+- `Receiver::try_recv() -> Result<T, TryRecvError>`
   - Non-blocking receive.
-- `Reciever::recv_timeout(Duration) -> Result<T, RecvTimeoutError>`
+- `Receiver::recv_timeout(Duration) -> Result<T, RecvTimeoutError>`
   - Blocking receive with timeout.
-- `Reciever::iter() -> Iter<'_, T>`
+- `Receiver::iter() -> Iter<'_, T>`
   - Blocking iterator until disconnected and drained.
-- `Reciever::try_iter() -> TryIter<'_, T>`
+- `Receiver::try_iter() -> TryIter<'_, T>`
   - Non-blocking iterator over currently available items.
 
 ## Examples
