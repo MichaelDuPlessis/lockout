@@ -176,8 +176,8 @@ impl<T> Drop for Queue<T> {
 }
 
 // Safety: All shared access uses atomic operations and hazard pointers.
-unsafe impl<T: Send + Sync> Send for Queue<T> {}
-unsafe impl<T: Send + Sync> Sync for Queue<T> {}
+unsafe impl<T: Send> Send for Queue<T> {}
+unsafe impl<T: Send> Sync for Queue<T> {}
 
 #[cfg(test)]
 mod tests {
