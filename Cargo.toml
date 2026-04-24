@@ -1,6 +1,6 @@
 [package]
 name = "lockout"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A collection of lock-free utilities for Rust"
 license = "MIT"
@@ -10,7 +10,7 @@ keywords = ["non-blocking", "lock-free", "atomic"]
 categories = ["concurrency", "data-structures"]
 
 [dependencies]
-lockout-hazard = "0.1.0"
+lockout-hazard = "0.1"
 lockout-channel = "0.1"
 
 [workspace]
