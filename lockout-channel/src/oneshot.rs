@@ -1,3 +1,19 @@
+//! A oneshot channel for sending a single value between threads.
+//!
+//! The channel is created with [`channel`], which returns a [`Sender`] and [`Receiver`] pair.
+//! Both halves are consumed on use, enforcing the single-use guarantee at the type level.
+//!
+//! # Examples
+//!
+//! ```
+//! use lockout_channel::oneshot;
+//! use std::thread;
+//!
+//! let (tx, rx) = oneshot::channel();
+//! thread::spawn(move || tx.send(42).unwrap());
+//! assert_eq!(rx.recv().unwrap(), 42);
+//! ```
+
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -10,11 +26,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Internal channel state, tracked atomically as a `u8`.
 #[derive(Debug)]
 #[repr(u8)]
 enum State {
+    /// No value has been sent yet.
     Empty,
+    /// A value has been written and is ready to read.
     Sent,
+    /// The channel is closed (sender or receiver was dropped).
     Closed,
 }
 
@@ -47,17 +67,26 @@ impl From<u8> for State {
     }
 }
 
+/// Shared state between [`Sender`] and [`Receiver`].
 #[derive(Debug)]
 struct Inner<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     state: AtomicU8,
+    /// Stores the receiver's thread handle so the sender can unpark it.
     receiver_thread: AtomicPtr<Thread>,
 }
 
+// Safety: Data is transferred (not shared) between threads. All access is
+// synchronized via atomic state transitions with appropriate orderings.
 unsafe impl<T: Send> Send for Inner<T> {}
 unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
+    /// Writes `msg` into the channel and transitions state to `Sent`.
+    ///
+    /// The data is written before the CAS so that the `Release` ordering on
+    /// success guarantees visibility to the receiver's `Acquire` load.
+    /// On failure the receiver is already gone, so reading the data back is safe.
     fn send(&self, msg: T) -> Result<(), SendError<T>> {
         unsafe { (&mut *self.data.get()).write(msg) };
         if self
@@ -83,6 +112,10 @@ impl<T> Inner<T> {
         Ok(())
     }
 
+    /// Blocks until a value is available or the sender is dropped.
+    ///
+    /// Registers the current thread for unparking before checking state,
+    /// preventing a missed-wakeup race with the sender.
     fn recv(&self) -> Result<T, RecvError> {
         let thread = Box::into_raw(Box::new(thread::current()));
         self.receiver_thread.store(thread, Ordering::Release);
@@ -101,6 +134,7 @@ impl<T> Inner<T> {
         Ok(unsafe { (&*self.data.get()).assume_init_read() })
     }
 
+    /// Returns the value immediately if available, without blocking.
     fn try_recv(&self) -> Result<T, TryRecvError> {
         match State::from(self.state.load(Ordering::Acquire)) {
             State::Empty => Err(TryRecvError::Empty),
@@ -109,6 +143,7 @@ impl<T> Inner<T> {
         }
     }
 
+    /// Blocks until a value is available, the sender is dropped, or the deadline passes.
     fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvTimeoutError> {
         let thread = Box::into_raw(Box::new(thread::current()));
         self.receiver_thread.store(thread, Ordering::Release);
@@ -138,6 +173,10 @@ impl<T> Inner<T> {
     }
 }
 
+/// The sending half of a oneshot channel.
+///
+/// Created by [`channel`]. Consumed on [`send`](Sender::send) or dropped
+/// to signal disconnection to the receiver.
 #[derive(Debug)]
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
@@ -148,6 +187,9 @@ impl<T> Sender<T> {
         Self { inner }
     }
 
+    /// Sends `msg` through the channel, consuming the sender.
+    ///
+    /// Returns `Err(SendError(msg))` if the receiver has been dropped.
     pub fn send(self, msg: T) -> Result<(), SendError<T>> {
         self.inner.send(msg)
     }
@@ -155,6 +197,7 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
+        // Transition to Closed only if no value was sent.
         if self
             .inner
             .state
@@ -174,6 +217,10 @@ impl<T> Drop for Sender<T> {
     }
 }
 
+/// The receiving half of a oneshot channel.
+///
+/// Created by [`channel`]. All receive methods consume the receiver,
+/// enforcing the single-use guarantee.
 #[derive(Debug)]
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
@@ -184,18 +231,22 @@ impl<T> Receiver<T> {
         Self { inner }
     }
 
+    /// Blocks until a value is received or the sender is dropped.
     pub fn recv(self) -> Result<T, RecvError> {
         self.inner.recv()
     }
 
+    /// Returns the value if it has already been sent, without blocking.
     pub fn try_recv(self) -> Result<T, TryRecvError> {
         self.inner.try_recv()
     }
 
+    /// Blocks for at most `timeout` waiting for a value.
     pub fn recv_timeout(self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         self.recv_deadline(Instant::now() + timeout)
     }
 
+    /// Blocks until a value is received, the sender is dropped, or `deadline` is reached.
     pub fn recv_deadline(self, deadline: Instant) -> Result<T, RecvTimeoutError> {
         self.inner.recv_deadline(deadline)
     }
@@ -203,6 +254,7 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
+        // If a value was sent but never received, drop it.
         if self
             .inner
             .state
@@ -214,6 +266,7 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
+/// Creates a new oneshot channel, returning the sender and receiver halves.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner {
         data: UnsafeCell::new(MaybeUninit::uninit()),
