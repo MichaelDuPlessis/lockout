@@ -74,6 +74,12 @@ enum WaiterState {
     Cancelled,
 }
 
+impl WaiterState {
+    const fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 impl From<WaiterState> for u8 {
     fn from(value: WaiterState) -> Self {
         value as u8
@@ -82,16 +88,16 @@ impl From<WaiterState> for u8 {
 
 impl From<WaiterState> for AtomicU8 {
     fn from(value: WaiterState) -> Self {
-        Self::new(value.into())
+        Self::new(value.to_u8())
     }
 }
 
 impl From<u8> for WaiterState {
     fn from(value: u8) -> Self {
         match value {
-            0 => WaiterState::Waiting,
-            1 => WaiterState::Notified,
-            2 => WaiterState::Cancelled,
+            0 => Self::Waiting,
+            1 => Self::Notified,
+            2 => Self::Cancelled,
             _ => panic!("This should never be reachable WaiterState can only be 0, 1, 2."),
         }
     }
@@ -161,8 +167,8 @@ impl<T> Inner<T> {
                 if waiter
                     .state
                     .compare_exchange(
-                        WaiterState::Waiting.into(),
-                        WaiterState::Notified.into(),
+                        WaiterState::Waiting.to_u8(),
+                        WaiterState::Notified.to_u8(),
                         Ordering::Release,
                         Ordering::Relaxed,
                     )
@@ -199,14 +205,14 @@ impl<T> Inner<T> {
                 if let Some(msg) = self.messages.dequeue() {
                     waiter
                         .state
-                        .store(WaiterState::Cancelled.into(), Ordering::Relaxed);
+                        .store(WaiterState::Cancelled.to_u8(), Ordering::Relaxed);
                     return Ok(msg);
                 }
 
                 if !self.has_senders() {
                     waiter
                         .state
-                        .store(WaiterState::Cancelled.into(), Ordering::Relaxed);
+                        .store(WaiterState::Cancelled.to_u8(), Ordering::Relaxed);
                     return Err(RecvTimeoutError::Disconnected);
                 }
 
@@ -218,7 +224,7 @@ impl<T> Inner<T> {
                             if now >= deadline {
                                 waiter
                                     .state
-                                    .store(WaiterState::Cancelled.into(), Ordering::Relaxed);
+                                    .store(WaiterState::Cancelled.to_u8(), Ordering::Relaxed);
                                 return Err(RecvTimeoutError::Timeout);
                             }
 
@@ -296,8 +302,8 @@ impl<T> Drop for Sender<T> {
                 if waiter
                     .state
                     .compare_exchange(
-                        WaiterState::Waiting.into(),
-                        WaiterState::Notified.into(),
+                        WaiterState::Waiting.to_u8(),
+                        WaiterState::Notified.to_u8(),
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     )
