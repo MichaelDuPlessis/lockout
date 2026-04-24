@@ -11,7 +11,7 @@ categories = ["concurrency", "data-structures"]
 
 [dependencies]
 lockout-hazard = "0.1.0"
-lockout-channel = "0.1.0"
+lockout-channel = "0.1"
 
 [workspace]
 members = ["lockout-channel","lockout-hazard"]
