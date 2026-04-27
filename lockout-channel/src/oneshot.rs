@@ -84,8 +84,9 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 impl<T> Inner<T> {
     /// Writes `msg` into the channel and transitions state to `Sent`.
     ///
-    /// The data is written before the CAS so that the `Release` ordering on
-    /// success guarantees visibility to the receiver's `Acquire` load.
+    /// The data is written before the CAS. `SeqCst` ordering on the state
+    /// CAS and `receiver_thread` load prevents store-buffer reordering that
+    /// could cause the sender to miss the receiver's thread handle.
     /// On failure the receiver is already gone, so reading the data back is safe.
     fn send(&self, msg: T) -> Result<(), SendError<T>> {
         unsafe { (&mut *self.data.get()).write(msg) };
@@ -94,7 +95,7 @@ impl<T> Inner<T> {
             .compare_exchange(
                 State::Empty.to_u8(),
                 State::Sent.to_u8(),
-                Ordering::Release,
+                Ordering::SeqCst,
                 Ordering::Relaxed,
             )
             .is_err()
@@ -104,7 +105,7 @@ impl<T> Inner<T> {
             }));
         }
 
-        let thread_ptr = self.receiver_thread.load(Ordering::Acquire);
+        let thread_ptr = self.receiver_thread.load(Ordering::SeqCst);
         if !thread_ptr.is_null() {
             unsafe { (*thread_ptr).unpark() };
         }
@@ -114,18 +115,23 @@ impl<T> Inner<T> {
 
     /// Blocks until a value is available or the sender is dropped.
     ///
-    /// Registers the current thread for unparking before checking state,
-    /// preventing a missed-wakeup race with the sender.
+    /// Registers the current thread for unparking before checking state.
+    /// Both operations use `SeqCst` to prevent store-buffer reordering
+    /// where the sender could miss the thread handle while the receiver
+    /// misses the state update.
     fn recv(&self) -> Result<T, RecvError> {
         let thread = Box::into_raw(Box::new(thread::current()));
-        self.receiver_thread.store(thread, Ordering::Release);
+        self.receiver_thread.store(thread, Ordering::SeqCst);
 
         loop {
-            let state = State::from(self.state.load(Ordering::Acquire));
+            let state = State::from(self.state.load(Ordering::SeqCst));
             match state {
                 State::Empty => thread::park(),
                 State::Sent => break,
-                State::Closed => return Err(RecvError),
+                State::Closed => {
+                    let _ = unsafe { Box::from_raw(self.receiver_thread.load(Ordering::Relaxed)) };
+                    return Err(RecvError);
+                }
             }
         }
 
@@ -146,10 +152,10 @@ impl<T> Inner<T> {
     /// Blocks until a value is available, the sender is dropped, or the deadline passes.
     fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvTimeoutError> {
         let thread = Box::into_raw(Box::new(thread::current()));
-        self.receiver_thread.store(thread, Ordering::Release);
+        self.receiver_thread.store(thread, Ordering::SeqCst);
 
         loop {
-            let state = State::from(self.state.load(Ordering::Acquire));
+            let state = State::from(self.state.load(Ordering::SeqCst));
             match state {
                 State::Empty => {
                     let now = Instant::now();
@@ -204,12 +210,12 @@ impl<T> Drop for Sender<T> {
             .compare_exchange(
                 State::Empty.to_u8(),
                 State::Closed.to_u8(),
-                Ordering::Release,
+                Ordering::SeqCst,
                 Ordering::Relaxed,
             )
             .is_ok()
         {
-            let thread_ptr = self.inner.receiver_thread.load(Ordering::Acquire);
+            let thread_ptr = self.inner.receiver_thread.load(Ordering::SeqCst);
             if !thread_ptr.is_null() {
                 unsafe { (*thread_ptr).unpark() };
             }
