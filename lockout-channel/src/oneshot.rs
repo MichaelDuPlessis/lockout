@@ -18,7 +18,6 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     sync::{
-        Arc,
         atomic::{AtomicPtr, AtomicU8, Ordering},
         mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError},
     },
@@ -100,9 +99,7 @@ impl<T> Inner<T> {
             )
             .is_err()
         {
-            return Err(SendError(unsafe {
-                (&mut *self.data.get()).assume_init_read()
-            }));
+            return Err(SendError(unsafe { (&*self.data.get()).assume_init_read() }));
         }
 
         let thread_ptr = self.receiver_thread.load(Ordering::SeqCst);
@@ -160,7 +157,8 @@ impl<T> Inner<T> {
                 State::Empty => {
                     let now = Instant::now();
                     if now >= deadline {
-                        let _ = unsafe { Box::from_raw(self.receiver_thread.load(Ordering::Relaxed)) };
+                        let _ =
+                            unsafe { Box::from_raw(self.receiver_thread.load(Ordering::Relaxed)) };
                         return Err(RecvTimeoutError::Timeout);
                     }
                     thread::park_timeout(deadline - now);
@@ -185,19 +183,23 @@ impl<T> Inner<T> {
 /// to signal disconnection to the receiver.
 #[derive(Debug)]
 pub struct Sender<T> {
-    inner: Arc<Inner<T>>,
+    inner: *mut Inner<T>,
 }
 
 impl<T> Sender<T> {
-    fn new(inner: Arc<Inner<T>>) -> Self {
+    fn new(inner: *mut Inner<T>) -> Self {
         Self { inner }
+    }
+
+    fn inner(&self) -> &Inner<T> {
+        unsafe { &*self.inner }
     }
 
     /// Sends `msg` through the channel, consuming the sender.
     ///
     /// Returns `Err(SendError(msg))` if the receiver has been dropped.
     pub fn send(self, msg: T) -> Result<(), SendError<T>> {
-        self.inner.send(msg)
+        self.inner().send(msg)
     }
 }
 
@@ -205,7 +207,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // Transition to Closed only if no value was sent.
         if self
-            .inner
+            .inner()
             .state
             .compare_exchange(
                 State::Empty.to_u8(),
@@ -215,10 +217,12 @@ impl<T> Drop for Sender<T> {
             )
             .is_ok()
         {
-            let thread_ptr = self.inner.receiver_thread.load(Ordering::SeqCst);
+            let thread_ptr = self.inner().receiver_thread.load(Ordering::SeqCst);
             if !thread_ptr.is_null() {
                 unsafe { (*thread_ptr).unpark() };
             }
+        } else {
+            drop(unsafe { Box::from_raw(self.inner) });
         }
     }
 }
@@ -229,22 +233,26 @@ impl<T> Drop for Sender<T> {
 /// enforcing the single-use guarantee.
 #[derive(Debug)]
 pub struct Receiver<T> {
-    inner: Arc<Inner<T>>,
+    inner: *mut Inner<T>,
 }
 
 impl<T> Receiver<T> {
-    fn new(inner: Arc<Inner<T>>) -> Self {
+    fn new(inner: *mut Inner<T>) -> Self {
         Self { inner }
+    }
+
+    fn inner(&self) -> &Inner<T> {
+        unsafe { &*self.inner }
     }
 
     /// Blocks until a value is received or the sender is dropped.
     pub fn recv(self) -> Result<T, RecvError> {
-        self.inner.recv()
+        self.inner().recv()
     }
 
     /// Returns the value if it has already been sent, without blocking.
     pub fn try_recv(self) -> Result<T, TryRecvError> {
-        self.inner.try_recv()
+        self.inner().try_recv()
     }
 
     /// Blocks for at most `timeout` waiting for a value.
@@ -254,7 +262,7 @@ impl<T> Receiver<T> {
 
     /// Blocks until a value is received, the sender is dropped, or `deadline` is reached.
     pub fn recv_deadline(self, deadline: Instant) -> Result<T, RecvTimeoutError> {
-        self.inner.recv_deadline(deadline)
+        self.inner().recv_deadline(deadline)
     }
 }
 
@@ -262,25 +270,28 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         // If a value was sent but never received, drop it.
         if self
-            .inner
+            .inner()
             .state
             .swap(State::Closed.to_u8(), Ordering::Acquire)
             == State::Sent.to_u8()
         {
-            unsafe { (&mut *self.inner.data.get()).assume_init_drop() };
+            unsafe { (&mut *self.inner().data.get()).assume_init_drop() };
         }
     }
 }
 
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
+
 /// Creates a new oneshot channel, returning the sender and receiver halves.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Arc::new(Inner {
+    let inner = Box::into_raw(Box::new(Inner {
         data: UnsafeCell::new(MaybeUninit::uninit()),
         state: AtomicU8::new(State::Empty.to_u8()),
         receiver_thread: AtomicPtr::new(std::ptr::null_mut()),
-    });
+    }));
 
-    let sender = Sender::new(Arc::clone(&inner));
+    let sender = Sender::new(inner);
     let receiver = Receiver::new(inner);
 
     (sender, receiver)
