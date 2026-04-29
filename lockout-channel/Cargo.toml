@@ -10,7 +10,7 @@ categories = ["concurrency", "data-structures"]
 readme = "README.md"
 
 [dependencies]
-lockout-hazard = "0.1.0"
+lockout-hazard = { version = "0.1", path = "../lockout-hazard" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
