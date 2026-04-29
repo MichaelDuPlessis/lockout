@@ -1,6 +1,6 @@
 [package]
 name = "lockout"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A collection of lock-free utilities for Rust"
 license = "MIT"
@@ -11,7 +11,7 @@ categories = ["concurrency", "data-structures"]
 
 [dependencies]
 lockout-hazard = { version = "0.1", path = "lockout-hazard" }
-lockout-channel = { version = "0.1", path = "lockout-channel" }
+lockout-channel = { version = "0.2", path = "lockout-channel" }
 
 [workspace]
 members = ["lockout-channel","lockout-hazard"]
