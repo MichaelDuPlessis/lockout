@@ -152,24 +152,7 @@ impl<T> Receiver<T> {
 
     /// Blocks until a value is received or the sender is dropped.
     pub fn recv(self) -> Result<T, RecvError> {
-        let thread = Box::into_raw(Box::new(thread::current()));
-        unsafe { *self.inner().receiver_thread.get() = thread };
-        let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
-
-        loop {
-            if !has_any(state, SENT | SENDER_CLOSED) {
-                thread::park()
-            } else if has(state, SENT) {
-                break;
-            } else if has(state, SENDER_CLOSED) {
-                return Err(RecvError);
-            }
-
-            state = self.inner().state.load(Ordering::Acquire);
-        }
-
-        self.inner().state.fetch_or(RECEIVED, Ordering::Acquire);
-        Ok(unsafe { (&*self.inner().data.get()).assume_init_read() })
+        self.wait(None).map_err(|_| RecvError)
     }
 
     /// Returns the value if it has already been sent, without blocking.
@@ -195,17 +178,26 @@ impl<T> Receiver<T> {
 
     /// Blocks until a value is received, the sender is dropped, or `deadline` is reached.
     pub fn recv_deadline(self, deadline: Instant) -> Result<T, RecvTimeoutError> {
+        self.wait(Some(deadline))
+    }
+
+    fn wait(self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
         let thread = Box::into_raw(Box::new(thread::current()));
         unsafe { *self.inner().receiver_thread.get() = thread };
         let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
 
         loop {
             if !has_any(state, SENT | SENDER_CLOSED) {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(RecvTimeoutError::Timeout);
+                match deadline {
+                    Some(dl) => {
+                        let now = Instant::now();
+                        if now >= dl {
+                            return Err(RecvTimeoutError::Timeout);
+                        }
+                        thread::park_timeout(dl - now);
+                    }
+                    None => thread::park(),
                 }
-                thread::park_timeout(deadline - now);
             } else if has(state, SENT) {
                 break;
             } else if has(state, SENDER_CLOSED) {
