@@ -26,11 +26,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Initial state — no flags set.
 const EMPTY: u8 = 0b0;
+/// Data has been written to the channel.
 const SENT: u8 = 0b00000001;
+/// The sender has been dropped or consumed.
 const SENDER_CLOSED: u8 = 0b00000010;
+/// The receiver has been dropped or consumed.
 const RECEIVER_CLOSED: u8 = 0b00000100;
+/// The receiver is parked and waiting for a value.
 const WAITING: u8 = 0b00001000;
+/// The receiver has read the data.
 const RECEIVED: u8 = 0b00010000;
 
 fn dealloc<T>(ptr: *mut T) {
@@ -80,6 +86,15 @@ impl<T> Sender<T> {
     /// Sends `msg` through the channel, consuming the sender.
     ///
     /// Returns `Err(SendError(msg))` if the receiver has been dropped.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::oneshot;
+    ///
+    /// let (tx, rx) = oneshot::channel();
+    /// tx.send(42).unwrap();
+    /// assert_eq!(rx.recv().unwrap(), 42);
+    /// ```
     pub fn send(self, msg: T) -> Result<(), SendError<T>> {
         unsafe { (&mut *self.inner().data.get()).write(msg) };
         let state = self
@@ -151,11 +166,30 @@ impl<T> Receiver<T> {
     }
 
     /// Blocks until a value is received or the sender is dropped.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::oneshot;
+    /// use std::thread;
+    ///
+    /// let (tx, rx) = oneshot::channel();
+    /// thread::spawn(move || tx.send(7).unwrap());
+    /// assert_eq!(rx.recv().unwrap(), 7);
+    /// ```
     pub fn recv(self) -> Result<T, RecvError> {
         self.wait(None).map_err(|_| RecvError)
     }
 
     /// Returns the value if it has already been sent, without blocking.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockout_channel::oneshot;
+    /// use std::sync::mpsc::TryRecvError;
+    ///
+    /// let (tx, rx) = oneshot::channel::<i32>();
+    /// assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    /// ```
     pub fn try_recv(self) -> Result<T, TryRecvError> {
         let state = self.inner().state.load(Ordering::Acquire);
 
@@ -181,6 +215,8 @@ impl<T> Receiver<T> {
         self.wait(Some(deadline))
     }
 
+    /// Parks the current thread until a value is sent, the sender is dropped,
+    /// or the optional deadline expires.
     fn wait(self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
         let thread = Box::into_raw(Box::new(thread::current()));
         unsafe { *self.inner().receiver_thread.get() = thread };
