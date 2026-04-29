@@ -126,7 +126,7 @@ impl<T> Queue<T> {
                 .domain
                 .protect(&self.head)
                 .expect("The queue should never be empty.");
-            let tail = self.tail.load(Ordering::Relaxed);
+            let tail = self.tail.load(Ordering::Acquire);
 
             if head.as_raw() != tail {
                 // Queue is not empty — try to advance head.
@@ -303,5 +303,48 @@ mod tests {
         results.sort();
         let expected: Vec<usize> = (0..producers * count).collect();
         assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn concurrent_dequeue_race() {
+        let q = Arc::new(Queue::new());
+        let items_per_producer = 50;
+        let producers = 4;
+        let consumers = 4;
+        let total = items_per_producer * producers;
+
+        let dequeued = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        // Consumers start first, spinning on an empty queue
+        for _ in 0..consumers {
+            let q = q.clone();
+            let dequeued = dequeued.clone();
+            handles.push(thread::spawn(move || {
+                loop {
+                    if q.dequeue().is_some() {
+                        dequeued.fetch_add(1, Ordering::Relaxed);
+                    } else if dequeued.load(Ordering::Relaxed) >= total {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        // Producers enqueue concurrently
+        for p in 0..producers {
+            let q = q.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..items_per_producer {
+                    q.enqueue(p * items_per_producer + i);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(dequeued.load(Ordering::Relaxed), total);
     }
 }
