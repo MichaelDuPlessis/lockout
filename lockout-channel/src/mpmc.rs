@@ -66,7 +66,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 enum WaiterState {
     Waiting,
