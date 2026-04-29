@@ -39,7 +39,7 @@ struct Inner<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     state: AtomicU8,
     /// Stores the receiver's thread handle so the sender can unpark it.
-    receiver_thread: *mut Thread,
+    receiver_thread: UnsafeCell<*mut Thread>,
 }
 
 // Safety: Data is transferred (not shared) between threads. All access is
@@ -70,12 +70,25 @@ impl<T> Sender<T> {
     /// Returns `Err(SendError(msg))` if the receiver has been dropped.
     pub fn send(self, msg: T) -> Result<(), SendError<T>> {
         unsafe { (&mut *self.inner().data.get()).write(msg) };
-        let state = self.inner().state.fetch_or(SENT, Ordering::AcqRel);
+        let state = self
+            .inner()
+            .state
+            .fetch_or(SENT | SENDER_CLOSED, Ordering::AcqRel);
 
-        if state & WAITING == WAITING {
-            unsafe { (*self.inner().receiver_thread).unpark() };
+        if state & RECEIVER_CLOSED == RECEIVER_CLOSED {
+            let msg = unsafe { (&*self.inner().data.get()).assume_init_read() };
+
+            drop(unsafe { Box::from_raw(self.inner) });
+            std::mem::forget(self);
+
+            return Err(SendError(msg));
         }
 
+        if state & WAITING == WAITING {
+            unsafe { (*(*self.inner().receiver_thread.get())).unpark() };
+        }
+
+        std::mem::forget(self);
         Ok(())
     }
 }
@@ -93,11 +106,15 @@ impl<T> Drop for Sender<T> {
             }
 
             if state & WAITING == WAITING {
-                let thread_ptr = self.inner().receiver_thread;
-                unsafe { (*thread_ptr).unpark() };
+                drop(unsafe { Box::from_raw(*self.inner().receiver_thread.get()) });
             }
 
             drop(unsafe { Box::from_raw(self.inner) });
+        } else {
+            if state & WAITING == WAITING {
+                let thread_ptr = unsafe { *self.inner().receiver_thread.get() };
+                unsafe { (*thread_ptr).unpark() };
+            }
         }
     }
 }
@@ -120,30 +137,23 @@ impl<T> Receiver<T> {
         unsafe { &*self.inner }
     }
 
-    fn inner_mut(&mut self) -> &mut Inner<T> {
-        unsafe { &mut *self.inner }
-    }
-
     /// Blocks until a value is received or the sender is dropped.
-    pub fn recv(mut self) -> Result<T, RecvError> {
+    pub fn recv(self) -> Result<T, RecvError> {
         let thread = Box::into_raw(Box::new(thread::current()));
-        self.inner_mut().receiver_thread = thread;
+        unsafe { *self.inner().receiver_thread.get() = thread };
         let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
 
         loop {
-            match state {
-                EMPTY => thread::park(),
-                SENT => break,
-                SENDER_CLOSED => {
-                    drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
-                    return Err(RecvError);
-                }
-                _ => unsafe { unreachable_unchecked() },
+            if state & (SENT | SENDER_CLOSED) == 0 {
+                thread::park()
+            } else if state & SENT == SENT {
+                break;
+            } else if state & SENDER_CLOSED == SENDER_CLOSED {
+                return Err(RecvError);
             }
+
             state = self.inner().state.load(Ordering::Acquire);
         }
-
-        drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
 
         self.inner().state.fetch_or(RECEIVED, Ordering::Acquire);
         Ok(unsafe { (&*self.inner().data.get()).assume_init_read() })
@@ -151,11 +161,17 @@ impl<T> Receiver<T> {
 
     /// Returns the value if it has already been sent, without blocking.
     pub fn try_recv(self) -> Result<T, TryRecvError> {
-        match self.inner().state.load(Ordering::Acquire) {
-            EMPTY => Err(TryRecvError::Empty),
-            SENT => Ok(unsafe { (&*self.inner().data.get()).assume_init_read() }),
-            SENDER_CLOSED => Err(TryRecvError::Disconnected),
-            _ => unsafe { unreachable_unchecked() },
+        let state = self.inner().state.load(Ordering::Acquire);
+
+        if state & (SENT | SENDER_CLOSED) == 0 {
+            Err(TryRecvError::Empty)
+        } else if state & SENT == SENT {
+            self.inner().state.fetch_or(RECEIVED, Ordering::Acquire);
+            Ok(unsafe { (&*self.inner().data.get()).assume_init_read() })
+        } else if state & SENDER_CLOSED == SENDER_CLOSED {
+            Err(TryRecvError::Disconnected)
+        } else {
+            unsafe { unreachable_unchecked() }
         }
     }
 
@@ -165,34 +181,28 @@ impl<T> Receiver<T> {
     }
 
     /// Blocks until a value is received, the sender is dropped, or `deadline` is reached.
-    pub fn recv_deadline(mut self, deadline: Instant) -> Result<T, RecvTimeoutError> {
+    pub fn recv_deadline(self, deadline: Instant) -> Result<T, RecvTimeoutError> {
         let thread = Box::into_raw(Box::new(thread::current()));
-        self.inner_mut().receiver_thread = thread;
+        unsafe { *self.inner().receiver_thread.get() = thread };
         let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
 
         loop {
-            match state {
-                EMPTY => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
-                        return Err(RecvTimeoutError::Timeout);
-                    }
-                    thread::park_timeout(deadline - now);
+            if state & (SENT | SENDER_CLOSED) == 0 {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(RecvTimeoutError::Timeout);
                 }
-                SENT => break,
-                SENDER_CLOSED => {
-                    drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
-                    return Err(RecvTimeoutError::Disconnected);
-                }
-                _ => unsafe { unreachable_unchecked() },
+                thread::park_timeout(deadline - now);
+            } else if state & SENT == SENT {
+                break;
+            } else if state & SENDER_CLOSED == SENDER_CLOSED {
+                return Err(RecvTimeoutError::Disconnected);
             }
 
             state = self.inner().state.load(Ordering::Acquire);
         }
 
-        drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
-
+        self.inner().state.fetch_or(RECEIVED, Ordering::Acquire);
         Ok(unsafe { (&*self.inner().data.get()).assume_init_read() })
     }
 }
@@ -210,7 +220,7 @@ impl<T> Drop for Receiver<T> {
             }
 
             if state & WAITING == WAITING {
-                drop(unsafe { Box::from_raw(self.inner().receiver_thread) });
+                drop(unsafe { Box::from_raw(*self.inner().receiver_thread.get()) });
             }
 
             drop(unsafe { Box::from_raw(self.inner) });
@@ -226,7 +236,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Box::into_raw(Box::new(Inner {
         data: UnsafeCell::new(MaybeUninit::uninit()),
         state: AtomicU8::new(EMPTY),
-        receiver_thread: std::ptr::null_mut(),
+        receiver_thread: UnsafeCell::new(std::ptr::null_mut()),
     }));
 
     let sender = Sender::new(inner);
