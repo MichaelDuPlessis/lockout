@@ -33,6 +33,10 @@ const RECEIVER_CLOSED: u8 = 0b00000100;
 const WAITING: u8 = 0b00001000;
 const RECEIVED: u8 = 0b00010000;
 
+fn dealloc<T>(ptr: *mut T) {
+    drop(unsafe { Box::from_raw(ptr) })
+}
+
 /// Shared state between [`Sender`] and [`Receiver`].
 #[derive(Debug)]
 struct Inner<T> {
@@ -78,7 +82,7 @@ impl<T> Sender<T> {
         if state & RECEIVER_CLOSED == RECEIVER_CLOSED {
             let msg = unsafe { (&*self.inner().data.get()).assume_init_read() };
 
-            drop(unsafe { Box::from_raw(self.inner) });
+            dealloc(self.inner);
             std::mem::forget(self);
 
             return Err(SendError(msg));
@@ -106,10 +110,10 @@ impl<T> Drop for Sender<T> {
             }
 
             if state & WAITING == WAITING {
-                drop(unsafe { Box::from_raw(*self.inner().receiver_thread.get()) });
+                dealloc(unsafe { *self.inner().receiver_thread.get() });
             }
 
-            drop(unsafe { Box::from_raw(self.inner) });
+            dealloc(self.inner);
         } else {
             if state & WAITING == WAITING {
                 let thread_ptr = unsafe { *self.inner().receiver_thread.get() };
@@ -220,10 +224,10 @@ impl<T> Drop for Receiver<T> {
             }
 
             if state & WAITING == WAITING {
-                drop(unsafe { Box::from_raw(*self.inner().receiver_thread.get()) });
+                dealloc(unsafe { *self.inner().receiver_thread.get() });
             }
 
-            drop(unsafe { Box::from_raw(self.inner) });
+            dealloc(self.inner);
         }
     }
 }
