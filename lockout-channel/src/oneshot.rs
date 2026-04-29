@@ -37,6 +37,14 @@ fn dealloc<T>(ptr: *mut T) {
     drop(unsafe { Box::from_raw(ptr) })
 }
 
+fn has(state: u8, flag: u8) -> bool {
+    state & flag == flag
+}
+
+fn has_any(state: u8, flags: u8) -> bool {
+    state & flags != 0
+}
+
 /// Shared state between [`Sender`] and [`Receiver`].
 #[derive(Debug)]
 struct Inner<T> {
@@ -79,7 +87,7 @@ impl<T> Sender<T> {
             .state
             .fetch_or(SENT | SENDER_CLOSED, Ordering::AcqRel);
 
-        if state & RECEIVER_CLOSED == RECEIVER_CLOSED {
+        if has(state, RECEIVER_CLOSED) {
             let msg = unsafe { (&*self.inner().data.get()).assume_init_read() };
 
             dealloc(self.inner);
@@ -88,8 +96,9 @@ impl<T> Sender<T> {
             return Err(SendError(msg));
         }
 
-        if state & WAITING == WAITING {
-            unsafe { (*(*self.inner().receiver_thread.get())).unpark() };
+        if has(state, WAITING) {
+            let thread_ptr = unsafe { *(*self.inner).receiver_thread.get() };
+            unsafe { (*thread_ptr).unpark() };
         }
 
         std::mem::forget(self);
@@ -104,18 +113,18 @@ impl<T> Drop for Sender<T> {
             .state
             .fetch_or(SENDER_CLOSED, Ordering::Acquire);
 
-        if state & RECEIVER_CLOSED == RECEIVER_CLOSED {
-            if state & SENT == SENT && state & RECEIVED != RECEIVED {
+        if has(state, RECEIVER_CLOSED) {
+            if has(state, SENT) && !has(state, RECEIVED) {
                 unsafe { (&mut *self.inner().data.get()).assume_init_drop() };
             }
 
-            if state & WAITING == WAITING {
+            if has(state, WAITING) {
                 dealloc(unsafe { *self.inner().receiver_thread.get() });
             }
 
             dealloc(self.inner);
         } else {
-            if state & WAITING == WAITING {
+            if has(state, WAITING) {
                 let thread_ptr = unsafe { *self.inner().receiver_thread.get() };
                 unsafe { (*thread_ptr).unpark() };
             }
@@ -148,11 +157,11 @@ impl<T> Receiver<T> {
         let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
 
         loop {
-            if state & (SENT | SENDER_CLOSED) == 0 {
+            if !has_any(state, SENT | SENDER_CLOSED) {
                 thread::park()
-            } else if state & SENT == SENT {
+            } else if has(state, SENT) {
                 break;
-            } else if state & SENDER_CLOSED == SENDER_CLOSED {
+            } else if has(state, SENDER_CLOSED) {
                 return Err(RecvError);
             }
 
@@ -167,12 +176,12 @@ impl<T> Receiver<T> {
     pub fn try_recv(self) -> Result<T, TryRecvError> {
         let state = self.inner().state.load(Ordering::Acquire);
 
-        if state & (SENT | SENDER_CLOSED) == 0 {
+        if !has_any(state, SENT | SENDER_CLOSED) {
             Err(TryRecvError::Empty)
-        } else if state & SENT == SENT {
+        } else if has(state, SENT) {
             self.inner().state.fetch_or(RECEIVED, Ordering::Acquire);
             Ok(unsafe { (&*self.inner().data.get()).assume_init_read() })
-        } else if state & SENDER_CLOSED == SENDER_CLOSED {
+        } else if has(state, SENDER_CLOSED) {
             Err(TryRecvError::Disconnected)
         } else {
             unsafe { unreachable_unchecked() }
@@ -191,15 +200,15 @@ impl<T> Receiver<T> {
         let mut state = self.inner().state.fetch_or(WAITING, Ordering::AcqRel);
 
         loop {
-            if state & (SENT | SENDER_CLOSED) == 0 {
+            if !has_any(state, SENT | SENDER_CLOSED) {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(RecvTimeoutError::Timeout);
                 }
                 thread::park_timeout(deadline - now);
-            } else if state & SENT == SENT {
+            } else if has(state, SENT) {
                 break;
-            } else if state & SENDER_CLOSED == SENDER_CLOSED {
+            } else if has(state, SENDER_CLOSED) {
                 return Err(RecvTimeoutError::Disconnected);
             }
 
@@ -218,12 +227,12 @@ impl<T> Drop for Receiver<T> {
             .state
             .fetch_or(RECEIVER_CLOSED, Ordering::Acquire);
 
-        if state & SENDER_CLOSED == SENDER_CLOSED {
-            if state & RECEIVED != RECEIVED && state & SENT == SENT {
+        if has(state, SENDER_CLOSED) {
+            if !has(state, RECEIVED) && has(state, SENT) {
                 unsafe { (&mut *self.inner().data.get()).assume_init_drop() };
             }
 
-            if state & WAITING == WAITING {
+            if has(state, WAITING) {
                 dealloc(unsafe { *self.inner().receiver_thread.get() });
             }
 
