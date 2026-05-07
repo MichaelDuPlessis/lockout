@@ -2,7 +2,7 @@
 //!
 //! This module provides an unbounded MPMC channel built on:
 //! - a lock-free Michael-Scott queue for message storage, and
-//! - a lock-free waiter stack for parking/unparking blocked receivers.
+//! - a mutex-protected waiter list for parking/unparking blocked receivers.
 //!
 //! # Semantics
 //!
@@ -53,12 +53,12 @@
 //! assert_eq!(v, vec![1, 2]);
 //! ```
 
-use crate::{ms_queue::Queue, treiber_stack::Stack};
+use crate::ms_queue::Queue;
 use std::iter::IntoIterator;
 use std::{
     hint::unreachable_unchecked,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, AtomicUsize, Ordering},
         mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError},
     },
@@ -118,21 +118,26 @@ impl Waiter {
     }
 }
 
-#[derive(Debug)]
 struct Inner<T> {
     sender_count: AtomicUsize,
     receiver_count: AtomicUsize,
     messages: Queue<T>,
-    waiters: Stack<Arc<Waiter>>,
+    waiters: Mutex<Vec<Arc<Waiter>>>,
+}
+
+impl<T> std::fmt::Debug for Inner<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner").finish_non_exhaustive()
+    }
 }
 
 impl<T> Inner<T> {
     fn receiver_count(&self) -> usize {
-        self.receiver_count.load(Ordering::SeqCst)
+        self.receiver_count.load(Ordering::Acquire)
     }
 
     fn sender_count(&self) -> usize {
-        self.sender_count.load(Ordering::SeqCst)
+        self.sender_count.load(Ordering::Acquire)
     }
 
     fn has_receivers(&self) -> bool {
@@ -144,26 +149,27 @@ impl<T> Inner<T> {
     }
 
     fn increment_receiver(&self) -> usize {
-        self.receiver_count.fetch_add(1, Ordering::SeqCst)
+        self.receiver_count.fetch_add(1, Ordering::Relaxed)
     }
 
     fn increment_sender(&self) -> usize {
-        self.sender_count.fetch_add(1, Ordering::SeqCst)
+        self.sender_count.fetch_add(1, Ordering::Relaxed)
     }
 
     fn decrement_receiver(&self) -> usize {
-        self.receiver_count.fetch_sub(1, Ordering::SeqCst)
+        self.receiver_count.fetch_sub(1, Ordering::AcqRel)
     }
 
     fn decrement_sender(&self) -> usize {
-        self.sender_count.fetch_sub(1, Ordering::SeqCst)
+        self.sender_count.fetch_sub(1, Ordering::AcqRel)
     }
 
     fn send(&self, msg: T) -> Result<(), SendError<T>> {
         if self.has_receivers() {
             self.messages.enqueue(msg);
 
-            while let Some(waiter) = self.waiters.pop() {
+            let mut lock = self.waiters.lock().unwrap();
+            while let Some(waiter) = lock.pop() {
                 if waiter
                     .state
                     .compare_exchange(
@@ -199,7 +205,7 @@ impl<T> Inner<T> {
             }
 
             let waiter = Arc::new(Waiter::new(WaiterState::Waiting));
-            self.waiters.push(Arc::clone(&waiter));
+            self.waiters.lock().unwrap().push(Arc::clone(&waiter));
 
             loop {
                 if let Some(msg) = self.messages.dequeue() {
@@ -298,13 +304,18 @@ impl<T> Drop for Sender<T> {
         let senders = self.inner.decrement_sender();
 
         if senders == 1 {
-            while let Some(waiter) = self.inner.waiters.pop() {
+            let waiters: Vec<Arc<Waiter>> = {
+                let mut lock = self.inner.waiters.lock().unwrap();
+                std::mem::take(&mut *lock)
+            };
+
+            for waiter in waiters {
                 if waiter
                     .state
                     .compare_exchange(
                         WaiterState::Waiting.to_u8(),
                         WaiterState::Notified.to_u8(),
-                        Ordering::Relaxed,
+                        Ordering::Release,
                         Ordering::Relaxed,
                     )
                     .is_ok()
@@ -536,7 +547,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         sender_count: AtomicUsize::new(1),
         receiver_count: AtomicUsize::new(1),
         messages: Queue::new(),
-        waiters: Stack::new(),
+        waiters: Mutex::new(Vec::new()),
     });
 
     let sender = Sender::new(Arc::clone(&inner));

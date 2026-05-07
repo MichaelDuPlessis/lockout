@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A lock-free Treiber stack with hazard-pointer reclamation.
 //!
 //! This is the classic CAS-based LIFO stack algorithm described by:
